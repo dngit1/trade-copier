@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Master Account</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Semi+Condensed:wght@600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #E6EBF0; --surface: #FFFFFF; --ink: #15202B; --muted: #5A6878; --line: #C9D2DB;
+    --good: #13784F; --bad: #C4322A; --amber: #A86B12; --focus: #2A63C9;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #10171E; --surface: #18222C; --ink: #E4EAF0; --muted: #93A2B2; --line: #2C3945;
+      --good: #3CC48A; --bad: #F0645A; --amber: #E3A640; --focus: #7FA8FF; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body { font-family: "Barlow", "Segoe UI", system-ui, sans-serif; font-size: 17px; line-height: 1.45;
+    padding: env(safe-area-inset-top, 0) 0 env(safe-area-inset-bottom, 0); font-variant-numeric: tabular-nums; }
+  h1, .big { font-family: "Barlow Semi Condensed", "Barlow", system-ui, sans-serif; }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .wrap { max-width: 520px; margin: 0 auto; padding: 28px 18px 40px; }
+  h1 { font-size: 30px; margin: 0; font-weight: 700; }
+  .sub { color: var(--muted); margin: 4px 0 24px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 22px 20px; }
+  .card + .card { margin-top: 14px; }
+  .label { color: var(--muted); font-size: 15px; }
+  .big { font-size: 34px; font-weight: 700; margin: 2px 0 0; word-break: break-word; }
+  .status { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: currentColor; flex: none; }
+  .good { color: var(--good); } .bad { color: var(--bad); } .amber { color: var(--amber); }
+  .muted { color: var(--muted); font-size: 15px; margin: 8px 0 0; }
+  label.field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 15px; }
+  select, input { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 6px; padding: 12px; font-size: 18px; width: 100%; }
+  .btn { width: 100%; margin-top: 14px; border: 0; border-radius: 6px; padding: 14px; font-weight: 700; font-size: 18px; cursor: pointer; background: var(--ink); color: var(--surface); }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .link { background: none; border: 0; color: var(--muted); text-decoration: underline; cursor: pointer; padding: 6px 0; margin-top: 18px; font-size: 15px; }
+  .error { color: var(--bad); font-weight: 600; min-height: 1.4em; margin: 10px 0 0; }
+  .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom, 0)); transform: translateX(-50%);
+    background: var(--ink); color: var(--surface); padding: 12px 18px; border-radius: 6px; font-weight: 600; max-width: calc(100% - 32px); }
+  .toast.is-error { background: var(--bad); color: #fff; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<main class="wrap">
+  <h1>Master Account</h1>
+  <p class="sub">Choose which NinjaTrader account the followers copy.</p>
+
+  <form id="login" class="card" hidden>
+    <label class="field">Master key (the <b>key=</b> line in master.txt)
+      <input id="keyInput" type="password" autocomplete="current-password" required>
+    </label>
+    <button class="btn" type="submit">Open</button>
+    <p id="loginError" class="error" role="alert"></p>
+  </form>
+
+  <div id="app" hidden>
+    <div class="card">
+      <div id="status" class="status"><span class="dot"></span><span>Checking…</span></div>
+      <p id="statusNote" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <div class="label">Followers are copying</div>
+      <div id="current" class="big">…</div>
+      <p id="switching" class="muted amber" hidden></p>
+    </div>
+
+    <div class="card">
+      <label class="field" for="accountSelect">Change to
+        <select id="accountSelect"></select>
+      </label>
+      <button id="switchBtn" class="btn" type="button" disabled>Switch account</button>
+      <p class="muted">Switch while you're flat. Followers keep any positions they already hold.</p>
+    </div>
+
+    <button id="signout" class="link" type="button">Sign out</button>
+  </div>
+</main>
+
+<div id="toast" class="toast" role="status" hidden></div>
+
+<script>
+(function () {
+  const STORE = "copierMasterKey";
+  const $ = (id) => document.getElementById(id);
+  let key = null, timer = null, last = null, toastTimer = null;
+  try { key = sessionStorage.getItem(STORE); } catch (e) {}
+
+  function toast(msg, isError) {
+    const t = $("toast");
+    t.textContent = msg; t.classList.toggle("is-error", !!isError); t.hidden = false;
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.hidden = true), 4500);
+  }
+
+  async function api(path, method, body) {
+    const res = await fetch(path, {
+      method: method || "GET",
+      headers: Object.assign({ "X-Master-Key": key || "" }, body ? { "Content-Type": "application/json" } : {}),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) { signOut(data.detail || "That key didn't work."); throw new Error("unauthorized"); }
+    if (!res.ok) throw new Error(data.detail || "Server error " + res.status);
+    return data;
+  }
+
+  function signOut(msg) {
+    key = null; clearInterval(timer);
+    try { sessionStorage.removeItem(STORE); } catch (e) {}
+    $("app").hidden = true; $("login").hidden = false;
+    $("loginError").textContent = msg || ""; $("keyInput").value = ""; $("keyInput").focus();
+  }
+
+  function render(s) {
+    last = s;
+    const st = $("status");
+    st.className = "status " + (s.online ? "good" : "bad");
+    st.lastElementChild.textContent = s.online ? "NinjaTrader connected" : "NinjaTrader not connected";
+    $("statusNote").textContent = s.online
+      ? s.followers_connected + (s.followers_connected === 1 ? " follower" : " followers") + " connected"
+      : "Open NinjaTrader on the master computer to change accounts.";
+
+    $("current").textContent = s.account || "Not reported yet";
+    $("switching").hidden = !s.switching_to;
+    $("switching").textContent = s.switching_to ? "Switching to " + s.switching_to + "… (about 5 seconds)" : "";
+
+    const sel = $("accountSelect");
+    if (document.activeElement !== sel) {
+      const keep = sel.value;
+      sel.replaceChildren(...(s.accounts || []).map((a) => {
+        const o = document.createElement("option"); o.value = a; o.textContent = a + (a === s.account ? "  (current)" : ""); return o;
+      }));
+      sel.value = (s.accounts || []).includes(keep) ? keep : (s.account || "");
+    }
+    updateButton();
+  }
+
+  function updateButton() {
+    const s = last;
+    $("switchBtn").disabled = !s || !s.online || !$("accountSelect").value || $("accountSelect").value === s.account || !!s.switching_to;
+  }
+
+  async function refresh() {
+    try { render(await api("/me/master")); }
+    catch (e) { if (e.message !== "unauthorized") $("statusNote").textContent = "Can't reach the server. Retrying…"; }
+  }
+
+  $("accountSelect").addEventListener("change", updateButton);
+  $("switchBtn").addEventListener("click", async () => {
+    const account = $("accountSelect").value;
+    if (!confirm("Followers will copy trades from " + account + " from now on. Continue?")) return;
+    try {
+      await api("/me/master/account", "POST", { account });
+      toast("Switching to " + account + ". This takes about 5 seconds.");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  });
+
+  function start() {
+    $("login").hidden = true; $("app").hidden = false;
+    refresh(); clearInterval(timer); timer = setInterval(refresh, 3000);
+  }
+  $("login").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    key = $("keyInput").value.trim();
+    try { sessionStorage.setItem(STORE, key); } catch (e) {}
+    start();
+  });
+  $("signout").addEventListener("click", () => signOut(""));
+  if (key) start(); else signOut("");
+})();
+</script>
+</body>
+</html>

@@ -230,6 +230,16 @@ async def admin_page():
     return FileResponse(HERE / "admin.html", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/master")
+async def master_page():
+    return FileResponse(HERE / "master.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/follower")
+async def follower_page():
+    return FileResponse(HERE / "follower.html", headers={"Cache-Control": "no-store"})
+
+
 # ---------------- master ----------------
 
 @app.post("/master/event")
@@ -357,28 +367,42 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
     }
 
 
+def validate_settings(body: dict, fields: tuple) -> dict:
+    out = {}
+    try:
+        if "multiplier" in fields:
+            out["multiplier"] = float(body["multiplier"])
+            if not 0 < out["multiplier"] <= 50:
+                raise HTTPException(status_code=400, detail="The multiplier must be above 0 and at most 50.")
+        if "max_contracts" in fields:
+            out["max_contracts"] = int(body["max_contracts"])
+            if not 1 <= out["max_contracts"] <= 500:
+                raise HTTPException(status_code=400, detail="Max contracts must be between 1 and 500.")
+        if "daily_loss_limit" in fields:
+            out["daily_loss_limit"] = float(body["daily_loss_limit"])
+            if out["daily_loss_limit"] < 0:
+                raise HTTPException(status_code=400, detail="The daily loss limit can't be negative (use 0 for no limit).")
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Please enter numbers only.")
+    return out
+
+
+async def apply_settings(fs: FollowerState, new: dict, changed_by: str) -> None:
+    fs.cfg.update(new)
+    saved = load_setting(f"follower:{fs.id}") or {}
+    saved.update(new)
+    save_setting(f"follower:{fs.id}", saved)
+    summary = ", ".join(f"{k}={v}" for k, v in new.items())
+    await alert(f"{fs.id} settings changed by {changed_by}: {summary}")
+    await check_loss_limit(fs)
+
+
 @app.post("/admin/followers/{follower_id}/settings")
 async def update_follower_settings(follower_id: str, body: dict = Body(...),
                                    x_admin_key: Optional[str] = Header(default=None)):
     require_admin(x_admin_key)
     fs = get_follower(follower_id)
-    try:
-        multiplier = float(body["multiplier"])
-        max_contracts = int(body["max_contracts"])
-        daily_loss_limit = float(body["daily_loss_limit"])
-    except (KeyError, TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="multiplier, max_contracts and daily_loss_limit must be numbers")
-    if not 0 < multiplier <= 50:
-        raise HTTPException(status_code=400, detail="multiplier must be above 0 and at most 50")
-    if not 1 <= max_contracts <= 500:
-        raise HTTPException(status_code=400, detail="max contracts must be between 1 and 500")
-    if daily_loss_limit < 0:
-        raise HTTPException(status_code=400, detail="daily loss limit can't be negative (use 0 for no limit)")
-    new = {"multiplier": multiplier, "max_contracts": max_contracts, "daily_loss_limit": daily_loss_limit}
-    fs.cfg.update(new)
-    save_setting(f"follower:{fs.id}", new)
-    await alert(f"{fs.id} settings changed: x{multiplier}, max {max_contracts}, daily loss {daily_loss_limit:.0f}")
-    await check_loss_limit(fs)
+    await apply_settings(fs, validate_settings(body, EDITABLE), "admin")
     return {"ok": True}
 
 
@@ -446,3 +470,105 @@ async def resume(follower_id: str, x_admin_key: Optional[str] = Header(default=N
     fs.strikes = 0
     await alert(f"{fs.id} resumed")
     return {"ok": True}
+
+
+# ---------------- self-service pages: /master and /follower ----------------
+# The master page logs in with the master key (from master.txt) and can only switch accounts.
+# The follower page logs in with that follower's own key (from follower.txt) and only sees that follower.
+
+def master_online(ms: dict) -> bool:
+    return bool(ms["last_hb"]) and time.time() - ms["last_hb"] <= MASTER_TIMEOUT_SEC
+
+
+def master_from_key(key: Optional[str]) -> dict:
+    master = MASTERS.get(key or "")
+    if not master:
+        raise HTTPException(status_code=401, detail="That master key isn't recognized.")
+    return master
+
+
+def follower_from_key(key: Optional[str]) -> FollowerState:
+    fs = FOLLOWER_BY_KEY.get(key or "")
+    if fs is None:
+        raise HTTPException(status_code=401, detail="That follower key isn't recognized.")
+    return fs
+
+
+@app.get("/me/master")
+async def my_master_status(x_master_key: Optional[str] = Header(default=None)):
+    master = master_from_key(x_master_key)
+    ms = MASTER_STATE[master["id"]]
+    switching = next((c.split("|", 1)[1] for _, c in ms["commands"] if c.startswith("account|")), None)
+    return {
+        "name": master["id"],
+        "online": master_online(ms),
+        "account": ms["account"],
+        "accounts": ms["accounts"],
+        "switching_to": switching,
+        "followers_connected": sum(1 for fs in FOLLOWERS if fs.cfg["master_id"] == master["id"] and fs.ws is not None),
+    }
+
+
+@app.post("/me/master/account")
+async def my_master_switch(body: dict = Body(...), x_master_key: Optional[str] = Header(default=None)):
+    master = master_from_key(x_master_key)
+    ms = MASTER_STATE[master["id"]]
+    if not master_online(ms):
+        raise HTTPException(status_code=409, detail="NinjaTrader on the master computer isn't connected, so the account can't be switched right now.")
+    account = str(body.get("account", "")).strip()
+    if not account or "|" in account:
+        raise HTTPException(status_code=400, detail="Pick an account first.")
+    if ms["accounts"] and account not in ms["accounts"]:
+        raise HTTPException(status_code=400, detail=f"{account} isn't connected in NinjaTrader on the master computer.")
+    queue_master_command(master["id"], f"account|{account}")
+    await alert(f"Master {master['id']}: switch to account {account} requested from the master page")
+    return {"ok": True}
+
+
+@app.get("/me/follower")
+async def my_follower_status(x_follower_key: Optional[str] = Header(default=None)):
+    fs = follower_from_key(x_follower_key)
+    ms = MASTER_STATE[fs.cfg["master_id"]]
+    return {
+        "name": fs.id,
+        "ninjatrader_connected": fs.ws is not None,
+        "copying": fs.ws is not None and not fs.paused,
+        "paused": fs.paused,
+        "pnl": fs.pnl,
+        "positions": fs.positions,
+        "multiplier": float(fs.cfg.get("multiplier", 1.0)),
+        "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
+        "master": {
+            "name": fs.cfg["master_id"],
+            "online": master_online(ms),
+            "seconds_since_hb": round(time.time() - ms["last_hb"], 1) if ms["last_hb"] else None,
+            "positions": {i: expected_position(p, fs) for i, p in ms["positions"].items() if p},
+        },
+    }
+
+
+@app.post("/me/follower/settings")
+async def my_follower_settings(body: dict = Body(...), x_follower_key: Optional[str] = Header(default=None)):
+    fs = follower_from_key(x_follower_key)
+    await apply_settings(fs, validate_settings(body, ("multiplier", "daily_loss_limit")), fs.id)
+    return {"ok": True}
+
+
+@app.post("/me/follower/stop")
+async def my_follower_stop(flatten: bool = False, x_follower_key: Optional[str] = Header(default=None)):
+    fs = follower_from_key(x_follower_key)
+    fs.paused = True
+    if flatten:
+        await send(fs, "flatten", "ALL")
+    await alert(f"{fs.id} stopped copying from the follower page (closed positions: {flatten})")
+    return {"ok": True}
+
+
+@app.post("/me/follower/start")
+async def my_follower_start(x_follower_key: Optional[str] = Header(default=None)):
+    fs = follower_from_key(x_follower_key)
+    fs.paused = False
+    fs.strikes = 0
+    await alert(f"{fs.id} resumed copying from the follower page")
+    await check_loss_limit(fs)
+    return {"ok": True, "paused": fs.paused}
