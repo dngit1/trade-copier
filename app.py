@@ -2,13 +2,17 @@
 Trade copier relay server.
 
 Master (NinjaTrader add-on)  --HTTP POST-->  this server  --WebSocket-->  Followers (NinjaTrader add-on)
+Control panel for you: https://<server>/admin
 
 Wire format is pipe-delimited plain text (easy to parse in NinjaScript):
   master -> server:
     order|new|<id>|<instrument>|<action>|<orderType>|<qty>|<limit>|<stop>|<oco>|<tif>
-    order|change|<id>|<instrument>|<action>|<orderType>|<qty>|<limit>|<stop>|<oco>|<tif>
+    order|change|<id>|...same as new
     order|cancel|<id>
-    hb|<positions>                      positions = "NQ 12-26=1;ES 12-26=-2"
+    hb|<positions>|<current account>|<all account names, comma separated>
+        positions = "NQ 12-26=1;ES 12-26=-2"
+  server -> master (in the reply to any POST):
+    ok  |  flatten|ALL  |  account|<new account name>
   server -> follower:
     new|<seq>|<id>|<instrument>|<action>|<orderType>|<qty>|<limit>|<stop>|<oco>|<tif>
     change|<seq>|...same as new
@@ -26,31 +30,59 @@ import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse
+from fastapi import Body, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, PlainTextResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("copier")
 
+HERE = Path(__file__).parent
 CONFIG_PATH = os.getenv("COPIER_CONFIG", "config.json")
 DB_PATH = os.getenv("COPIER_DB", "copier.db")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
-MASTER_TIMEOUT_SEC = 15      # no heartbeat for this long -> master offline alert
-MASTER_FLATTEN_EXPIRY_SEC = 60  # a queued master flatten is dropped if the master doesn't pick it up in time
+MASTER_TIMEOUT_SEC = 15         # no heartbeat for this long -> master offline alert
 FOLLOWER_TIMEOUT_SEC = 15
-RECON_STRIKES = 3            # consecutive 5s checks with mismatched positions before alerting
+MASTER_COMMAND_EXPIRY_SEC = 60  # a queued master command is dropped if the master doesn't pick it up in time
+RECON_STRIKES = 3               # consecutive 5s checks with mismatched positions before alerting
 
 with open(CONFIG_PATH) as f:
     CFG = json.load(f)
 
+DB = sqlite3.connect(DB_PATH, check_same_thread=False)
+DB.execute("create table if not exists events (ts real, source text, who text, body text)")
+DB.execute("create table if not exists settings (k text primary key, v text)")
+DB.commit()
+
+
+def log_event(source: str, who: str, body: str) -> None:
+    DB.execute("insert into events values (?, ?, ?, ?)", (time.time(), source, who, body))
+    DB.commit()
+
+
+def load_setting(k: str) -> Optional[dict]:
+    row = DB.execute("select v from settings where k = ?", (k,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def save_setting(k: str, v: dict) -> None:
+    DB.execute("insert or replace into settings values (?, ?)", (k, json.dumps(v)))
+    DB.commit()
+
+
+EDITABLE = ("multiplier", "max_contracts", "daily_loss_limit")
+
 
 class FollowerState:
     def __init__(self, cfg: dict):
-        self.cfg = cfg
+        self.cfg = dict(cfg)
+        saved = load_setting(f"follower:{cfg['id']}")
+        if saved:  # changes made in the control panel override config.json
+            self.cfg.update({k: v for k, v in saved.items() if k in EDITABLE})
         self.id = cfg["id"]
         self.ws: Optional[WebSocket] = None
         self.paused = False
@@ -62,20 +94,15 @@ class FollowerState:
 
 
 MASTERS = {m["key"]: m for m in CFG["masters"]}
-MASTER_STATE = {m["id"]: {"last_hb": 0.0, "positions": {}, "offline_alerted": False, "flatten_requested_at": 0.0} for m in CFG["masters"]}
+MASTER_STATE = {
+    m["id"]: {"last_hb": 0.0, "positions": {}, "offline_alerted": False,
+              "account": None, "accounts": [], "commands": []}
+    for m in CFG["masters"]
+}
 FOLLOWERS = [FollowerState(fc) for fc in CFG["followers"]]
 FOLLOWER_BY_KEY = {fs.cfg["key"]: fs for fs in FOLLOWERS}
 FOLLOWER_BY_ID = {fs.id: fs for fs in FOLLOWERS}
 SEQ = itertools.count(1)
-
-DB = sqlite3.connect(DB_PATH, check_same_thread=False)
-DB.execute("create table if not exists events (ts real, source text, who text, body text)")
-DB.commit()
-
-
-def log_event(source: str, who: str, body: str) -> None:
-    DB.execute("insert into events values (?, ?, ?, ?)", (time.time(), source, who, body))
-    DB.commit()
 
 
 async def alert(msg: str) -> None:
@@ -139,6 +166,21 @@ async def fan_out(master_id: str, parts: list) -> None:
         await send(fs, kind, f"{oid}|{inst}|{action}|{otype}|{q}|{limit}|{stop}|{oco}|{tif}")
 
 
+def queue_master_command(master_id: str, command: str) -> None:
+    MASTER_STATE[master_id]["commands"].append((time.time(), command))
+
+
+def master_reply(master_id: str, ms: dict) -> PlainTextResponse:
+    """Commands for the master ride back on the response to its next POST (heartbeats come every 5s)."""
+    while ms["commands"]:
+        queued_at, command = ms["commands"].pop(0)
+        if time.time() - queued_at <= MASTER_COMMAND_EXPIRY_SEC:
+            log_event("sent", master_id, command)
+            return PlainTextResponse(command)
+        log_event("expired", master_id, command)
+    return PlainTextResponse("ok")
+
+
 async def monitor() -> None:
     while True:
         await asyncio.sleep(5)
@@ -183,6 +225,13 @@ async def health():
     return {"ok": True}
 
 
+@app.get("/admin")
+async def admin_page():
+    return FileResponse(HERE / "admin.html", headers={"Cache-Control": "no-store"})
+
+
+# ---------------- master ----------------
+
 @app.post("/master/event")
 async def master_event(request: Request, x_master_key: Optional[str] = Header(default=None)):
     master = MASTERS.get(x_master_key or "")
@@ -198,6 +247,12 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
 
     if parts[0] == "hb":
         ms["positions"] = parse_positions(parts[1] if len(parts) > 1 else "")
+        if len(parts) > 2 and parts[2]:
+            if ms["account"] and ms["account"] != parts[2]:
+                await alert(f"Master {master['id']} now copying from account {parts[2]} (was {ms['account']})")
+            ms["account"] = parts[2]
+        if len(parts) > 3:
+            ms["accounts"] = sorted(a for a in parts[3].split(",") if a)
         return master_reply(master["id"], ms)
 
     log_event("master", master["id"], body)
@@ -208,17 +263,7 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
     return master_reply(master["id"], ms)
 
 
-def master_reply(master_id: str, ms: dict) -> PlainTextResponse:
-    """Commands for the master ride back on the response to its next POST (heartbeats come every 5s)."""
-    requested = ms["flatten_requested_at"]
-    if requested:
-        ms["flatten_requested_at"] = 0.0
-        if time.time() - requested <= MASTER_FLATTEN_EXPIRY_SEC:
-            log_event("sent", master_id, "flatten|ALL")
-            return PlainTextResponse("flatten|ALL")
-        log_event("expired", master_id, "flatten|ALL")
-    return PlainTextResponse("ok")
-
+# ---------------- followers ----------------
 
 @app.websocket("/ws/follower")
 async def follower_socket(ws: WebSocket):
@@ -244,11 +289,7 @@ async def follower_socket(ws: WebSocket):
                 fs.last_hb = time.time()
                 fs.pnl = float(parts[1])
                 fs.positions = parse_positions(parts[2])
-                limit = fs.cfg.get("daily_loss_limit")
-                if limit and fs.pnl <= -abs(float(limit)) and not fs.paused:
-                    fs.paused = True
-                    await send(fs, "flatten", "ALL")
-                    await alert(f"{fs.id} hit daily loss limit (P&L {fs.pnl:.2f}); flattened and paused")
+                await check_loss_limit(fs)
             elif parts[0] == "ack":
                 log_event("ack", fs.id, text)
                 if len(parts) > 2 and parts[2] == "err":
@@ -261,9 +302,26 @@ async def follower_socket(ws: WebSocket):
             await alert(f"Follower {fs.id} disconnected")
 
 
+async def check_loss_limit(fs: FollowerState) -> None:
+    limit = float(fs.cfg.get("daily_loss_limit") or 0)
+    if limit > 0 and fs.pnl <= -limit and not fs.paused:
+        fs.paused = True
+        await send(fs, "flatten", "ALL")
+        await alert(f"{fs.id} hit daily loss limit (P&L {fs.pnl:.2f}); flattened and paused")
+
+
+# ---------------- admin ----------------
+
 def require_admin(key: Optional[str]) -> None:
     if key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="bad admin key")
+
+
+def get_follower(follower_id: str) -> FollowerState:
+    fs = FOLLOWER_BY_ID.get(follower_id)
+    if fs is None:
+        raise HTTPException(status_code=404, detail=f"no follower {follower_id}")
+    return fs
 
 
 @app.get("/status")
@@ -272,16 +330,73 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
     now = time.time()
     return {
         "masters": {
-            mid: {"seconds_since_hb": round(now - ms["last_hb"], 1) if ms["last_hb"] else None,
-                  "positions": ms["positions"]}
+            mid: {
+                "online": bool(ms["last_hb"]) and now - ms["last_hb"] <= MASTER_TIMEOUT_SEC,
+                "seconds_since_hb": round(now - ms["last_hb"], 1) if ms["last_hb"] else None,
+                "positions": ms["positions"],
+                "account": ms["account"],
+                "accounts": ms["accounts"],
+                "pending_commands": [c for _, c in ms["commands"]],
+            }
             for mid, ms in MASTER_STATE.items()
         },
         "followers": {
-            fs.id: {"connected": fs.ws is not None, "paused": fs.paused, "pnl": fs.pnl,
-                    "positions": fs.positions, "master": fs.cfg["master_id"]}
+            fs.id: {
+                "connected": fs.ws is not None,
+                "paused": fs.paused,
+                "pnl": fs.pnl,
+                "positions": fs.positions,
+                "master": fs.cfg["master_id"],
+                "mismatch": fs.strikes >= RECON_STRIKES,
+                "multiplier": float(fs.cfg.get("multiplier", 1.0)),
+                "max_contracts": int(fs.cfg.get("max_contracts", 1)),
+                "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
+            }
             for fs in FOLLOWERS
         },
     }
+
+
+@app.post("/admin/followers/{follower_id}/settings")
+async def update_follower_settings(follower_id: str, body: dict = Body(...),
+                                   x_admin_key: Optional[str] = Header(default=None)):
+    require_admin(x_admin_key)
+    fs = get_follower(follower_id)
+    try:
+        multiplier = float(body["multiplier"])
+        max_contracts = int(body["max_contracts"])
+        daily_loss_limit = float(body["daily_loss_limit"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="multiplier, max_contracts and daily_loss_limit must be numbers")
+    if not 0 < multiplier <= 50:
+        raise HTTPException(status_code=400, detail="multiplier must be above 0 and at most 50")
+    if not 1 <= max_contracts <= 500:
+        raise HTTPException(status_code=400, detail="max contracts must be between 1 and 500")
+    if daily_loss_limit < 0:
+        raise HTTPException(status_code=400, detail="daily loss limit can't be negative (use 0 for no limit)")
+    new = {"multiplier": multiplier, "max_contracts": max_contracts, "daily_loss_limit": daily_loss_limit}
+    fs.cfg.update(new)
+    save_setting(f"follower:{fs.id}", new)
+    await alert(f"{fs.id} settings changed: x{multiplier}, max {max_contracts}, daily loss {daily_loss_limit:.0f}")
+    await check_loss_limit(fs)
+    return {"ok": True}
+
+
+@app.post("/admin/masters/{master_id}/account")
+async def switch_master_account(master_id: str, body: dict = Body(...),
+                                x_admin_key: Optional[str] = Header(default=None)):
+    require_admin(x_admin_key)
+    ms = MASTER_STATE.get(master_id)
+    if ms is None:
+        raise HTTPException(status_code=404, detail=f"no master {master_id}")
+    account = str(body.get("account", "")).strip()
+    if not account or "|" in account:
+        raise HTTPException(status_code=400, detail="pick an account")
+    if ms["accounts"] and account not in ms["accounts"]:
+        raise HTTPException(status_code=400, detail=f"{account} isn't connected in NinjaTrader on the master computer")
+    queue_master_command(master_id, f"account|{account}")
+    await alert(f"Master {master_id}: switch to account {account} requested")
+    return {"ok": True}
 
 
 @app.post("/admin/kill")
@@ -304,7 +419,7 @@ async def kill_all(x_admin_key: Optional[str] = Header(default=None)):
     now = time.time()
     offline = []
     for mid, ms in MASTER_STATE.items():
-        ms["flatten_requested_at"] = now
+        queue_master_command(mid, "flatten|ALL")
         if not ms["last_hb"] or now - ms["last_hb"] > MASTER_TIMEOUT_SEC:
             offline.append(mid)
     note = f" WARNING: master(s) {offline} offline - flatten them by hand." if offline else ""
@@ -315,7 +430,7 @@ async def kill_all(x_admin_key: Optional[str] = Header(default=None)):
 @app.post("/admin/pause/{follower_id}")
 async def pause(follower_id: str, flatten: bool = False, x_admin_key: Optional[str] = Header(default=None)):
     require_admin(x_admin_key)
-    fs = FOLLOWER_BY_ID.get(follower_id) or _missing(follower_id)
+    fs = get_follower(follower_id)
     fs.paused = True
     if flatten:
         await send(fs, "flatten", "ALL")
@@ -326,12 +441,8 @@ async def pause(follower_id: str, flatten: bool = False, x_admin_key: Optional[s
 @app.post("/admin/resume/{follower_id}")
 async def resume(follower_id: str, x_admin_key: Optional[str] = Header(default=None)):
     require_admin(x_admin_key)
-    fs = FOLLOWER_BY_ID.get(follower_id) or _missing(follower_id)
+    fs = get_follower(follower_id)
     fs.paused = False
     fs.strikes = 0
     await alert(f"{fs.id} resumed")
     return {"ok": True}
-
-
-def _missing(follower_id: str):
-    raise HTTPException(status_code=404, detail=f"no follower {follower_id}")

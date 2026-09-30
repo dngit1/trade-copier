@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Trade Copier Control</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Semi+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #E6EBF0;
+    --surface: #FFFFFF;
+    --ink: #15202B;
+    --muted: #5A6878;
+    --line: #C9D2DB;
+    --long: #13784F;
+    --short: #C4322A;
+    --amber: #A86B12;
+    --focus: #2A63C9;
+    --stripe-a: #C4322A;
+    --stripe-b: #F4C542;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10171E; --surface: #18222C; --ink: #E4EAF0; --muted: #93A2B2;
+      --line: #2C3945; --long: #3CC48A; --short: #F0645A; --amber: #E3A640; --focus: #7FA8FF;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font-family: "Barlow", "Segoe UI", system-ui, sans-serif;
+    font-size: 16px; line-height: 1.45;
+    padding: env(safe-area-inset-top, 0) 0 calc(120px + env(safe-area-inset-bottom, 0));
+    font-variant-numeric: tabular-nums;
+  }
+  h1, h2, h3, .num { font-family: "Barlow Semi Condensed", "Barlow", system-ui, sans-serif; }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+  .wrap { max-width: 980px; margin: 0 auto; padding: 20px 16px; }
+  header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  header.top h1 { font-size: 28px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+  .updated { color: var(--muted); font-size: 14px; }
+  .signout { background: none; border: 0; color: var(--muted); text-decoration: underline; cursor: pointer; padding: 4px; }
+
+  section { margin-top: 28px; }
+  section > h2 { font-size: 20px; font-weight: 600; margin: 0 0 10px; }
+
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
+  .panel + .panel { margin-top: 12px; }
+  .row-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .row-head h3 { margin: 0; font-size: 20px; font-weight: 600; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 600; padding: 2px 10px; border-radius: 99px; border: 1px solid currentColor; }
+  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .ok { color: var(--long); } .warn { color: var(--amber); } .bad { color: var(--short); }
+
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 20px; margin: 14px 0 0; }
+  .facts dt { color: var(--muted); font-size: 14px; }
+  .facts dd { margin: 0; font-size: 20px; font-weight: 600; }
+  .pos-long { color: var(--long); } .pos-short { color: var(--short); }
+
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 16px; }
+  label.field { display: flex; flex-direction: column; gap: 4px; font-size: 14px; color: var(--muted); }
+  label.field input, label.field select {
+    border: 1px solid var(--line); background: var(--bg); border-radius: 4px; padding: 9px 10px; font-size: 17px; color: var(--ink);
+  }
+  .hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; max-width: 70ch; }
+
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .btn { border: 1px solid var(--line); background: var(--surface); border-radius: 4px; padding: 9px 14px; font-weight: 600; cursor: pointer; }
+  .btn:hover:not(:disabled) { border-color: var(--ink); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+  .btn.danger { color: var(--short); border-color: var(--short); }
+
+  /* The one loud element: the emergency bar, fixed to the bottom like a guarded switch. */
+  .estop {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
+    background: var(--surface);
+    border-top: 6px solid transparent;
+    border-image: repeating-linear-gradient(-45deg, var(--stripe-a) 0 12px, var(--stripe-b) 12px 24px) 6;
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0));
+  }
+  .estop .inner { max-width: 980px; margin: 0 auto; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .estop .label { font-family: "Barlow Semi Condensed", system-ui, sans-serif; font-weight: 700; font-size: 18px; margin-right: auto; }
+  .estop button { border: 0; border-radius: 4px; padding: 12px 18px; font-weight: 700; cursor: pointer; color: #fff; background: var(--short); }
+  .estop button.soft { background: transparent; color: var(--short); border: 2px solid var(--short); }
+
+  .login { max-width: 420px; margin: 12vh auto 0; }
+  .login h1 { font-size: 30px; margin: 0 0 6px; }
+  .login p { color: var(--muted); margin: 0 0 18px; }
+  .error { color: var(--short); font-weight: 600; min-height: 1.4em; margin: 8px 0 0; }
+
+  .toast { position: fixed; left: 50%; bottom: calc(96px + env(safe-area-inset-bottom, 0)); transform: translateX(-50%); z-index: 6;
+    background: var(--ink); color: var(--surface); padding: 10px 16px; border-radius: 4px; font-weight: 600; max-width: calc(100% - 32px); }
+  .toast.is-error { background: var(--short); color: #fff; }
+  [hidden] { display: none !important; }
+  @media (prefers-reduced-motion: no-preference) { .toast { transition: opacity .2s; } }
+</style>
+</head>
+<body>
+
+<div id="login" class="wrap login" hidden>
+  <h1>Trade Copier Control</h1>
+  <p>Enter the admin key you set as ADMIN_KEY on Render.</p>
+  <form id="loginForm">
+    <label class="field">Admin key
+      <input id="keyInput" type="password" autocomplete="current-password" required>
+    </label>
+    <div class="actions"><button class="btn primary" type="submit">Open control panel</button></div>
+    <p id="loginError" class="error" role="alert"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <div class="wrap">
+    <header class="top">
+      <h1>Trade Copier Control</h1>
+      <div><span id="updated" class="updated">Connecting…</span> <button id="signout" class="signout" type="button">Sign out</button></div>
+    </header>
+
+    <section>
+      <h2>Master</h2>
+      <div id="masters"></div>
+    </section>
+
+    <section>
+      <h2>Followers</h2>
+      <div id="followers"></div>
+    </section>
+  </div>
+
+  <div class="estop" role="region" aria-label="Emergency controls">
+    <div class="inner">
+      <span class="label">Emergency</span>
+      <button id="killFollowers" class="soft" type="button">Flatten followers</button>
+      <button id="killAll" type="button">Flatten everything</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+
+<script>
+(function () {
+  const KEY_STORE = "copierAdminKey";
+  let adminKey = null;
+  try { adminKey = sessionStorage.getItem(KEY_STORE); } catch (e) {}
+  let timer = null;
+  const $ = (id) => document.getElementById(id);
+
+  function el(tag, attrs, children) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === "text") n.textContent = v;
+      else if (k === "class") n.className = v;
+      else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+      else n.setAttribute(k, v);
+    }
+    (children || []).forEach((c) => n.appendChild(c));
+    return n;
+  }
+
+  let toastTimer = null;
+  function toast(msg, isError) {
+    const t = $("toast");
+    t.textContent = msg;
+    t.classList.toggle("is-error", !!isError);
+    t.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (t.hidden = true), 4000);
+  }
+
+  async function api(path, method, body) {
+    const res = await fetch(path, {
+      method: method || "GET",
+      headers: Object.assign({ "X-Admin-Key": adminKey || "" }, body ? { "Content-Type": "application/json" } : {}),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 401) { signOut("That admin key didn't work. Check ADMIN_KEY on Render."); throw new Error("unauthorized"); }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("Server error " + res.status));
+    return data;
+  }
+
+  function signOut(message) {
+    adminKey = null;
+    try { sessionStorage.removeItem(KEY_STORE); } catch (e) {}
+    clearInterval(timer);
+    $("app").hidden = true;
+    $("login").hidden = false;
+    $("loginError").textContent = message || "";
+    $("keyInput").value = "";
+    $("keyInput").focus();
+  }
+
+  function positionsText(pos) {
+    const entries = Object.entries(pos || {}).filter(([, q]) => q);
+    if (!entries.length) return [el("span", { text: "Flat" })];
+    return entries.map(([inst, q], i) =>
+      el("span", { class: q > 0 ? "pos-long" : "pos-short", text: (i ? ", " : "") + (q > 0 ? "Long " : "Short ") + Math.abs(q) + " " + inst }));
+  }
+
+  function fact(label, valueNodes) {
+    const dd = el("dd", { class: "num" });
+    (Array.isArray(valueNodes) ? valueNodes : [valueNodes]).forEach((n) => dd.appendChild(typeof n === "string" ? document.createTextNode(n) : n));
+    return el("div", {}, [el("dt", { text: label }), dd]);
+  }
+
+  // ---------- master ----------
+  const masterViews = {};
+
+  function renderMaster(id, m) {
+    let v = masterViews[id];
+    if (!v) {
+      v = masterViews[id] = {};
+      v.pill = el("span", { class: "pill" });
+      v.facts = el("dl", { class: "facts" });
+      v.select = el("select", { id: "acct-" + id });
+      v.button = el("button", { class: "btn primary", type: "button", text: "Switch account", onclick: () => switchAccount(id) });
+      v.hint = el("p", { class: "hint" });
+      v.root = el("div", { class: "panel" }, [
+        el("div", { class: "row-head" }, [el("h3", { text: id }), v.pill]),
+        v.facts,
+        el("div", { class: "fields" }, [el("label", { class: "field", for: "acct-" + id }, [document.createTextNode("Copy trades from account"), v.select])]),
+        el("div", { class: "actions" }, [v.button]),
+        v.hint,
+      ]);
+      $("masters").appendChild(v.root);
+    }
+    v.pill.textContent = m.online ? "Online" : "Offline";
+    v.pill.className = "pill " + (m.online ? "ok" : "bad");
+
+    v.facts.replaceChildren(
+      fact("Copying from", m.account || "Not reported yet"),
+      fact("Position", positionsText(m.positions)),
+      fact("Last heartbeat", m.seconds_since_hb == null ? "Never" : m.seconds_since_hb + "s ago"),
+    );
+
+    const accounts = m.accounts || [];
+    if (document.activeElement !== v.select) {
+      const chosen = v.select.value || m.account;
+      v.select.replaceChildren(...accounts.map((a) => el("option", { value: a, text: a })));
+      if (accounts.includes(chosen)) v.select.value = chosen;
+    }
+    const switching = (m.pending_commands || []).find((c) => c.startsWith("account|"));
+    v.button.disabled = !m.online || !accounts.length || v.select.value === m.account || !!switching;
+    v.hint.textContent = switching
+      ? "Switching to " + switching.split("|")[1] + ". The master picks this up within about 5 seconds."
+      : !m.online
+      ? "The master computer isn't connected. Start NinjaTrader there to change accounts."
+      : "Only accounts connected in NinjaTrader on the master computer are listed. Switch while flat: followers keep any positions they already hold.";
+  }
+
+  async function switchAccount(id) {
+    const v = masterViews[id];
+    const account = v.select.value;
+    if (!confirm("Copy trades from " + account + " from now on?\n\nFollowers keep any positions they already hold. Flatten them first if the old account had open trades.")) return;
+    try {
+      await api("/admin/masters/" + encodeURIComponent(id) + "/account", "POST", { account });
+      toast("Switch sent. The master will move to " + account + " within about 5 seconds.");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  }
+
+  // ---------- followers ----------
+  const followerViews = {};
+
+  function numberField(label, id, step, min) {
+    const input = el("input", { id, type: "number", step, min, inputmode: "decimal" });
+    return { input, node: el("label", { class: "field", for: id }, [document.createTextNode(label), input]) };
+  }
+
+  function renderFollower(id, f) {
+    let v = followerViews[id];
+    if (!v) {
+      v = followerViews[id] = { dirty: false };
+      v.pill = el("span", { class: "pill" });
+      v.facts = el("dl", { class: "facts" });
+      v.mult = numberField("Size multiplier", "mult-" + id, "0.1", "0.1");
+      v.max = numberField("Max contracts", "max-" + id, "1", "1");
+      v.loss = numberField("Daily loss limit ($, 0 = off)", "loss-" + id, "50", "0");
+      [v.mult, v.max, v.loss].forEach((fld) => fld.input.addEventListener("input", () => { v.dirty = true; v.save.disabled = false; }));
+      v.save = el("button", { class: "btn primary", type: "button", text: "Save changes", disabled: "", onclick: () => saveFollower(id) });
+      v.toggle = el("button", { class: "btn", type: "button" });
+      v.pauseFlat = el("button", { class: "btn danger", type: "button", text: "Pause and flatten", onclick: () => pause(id, true) });
+      v.root = el("div", { class: "panel" }, [
+        el("div", { class: "row-head" }, [el("h3", { text: id }), v.pill]),
+        v.facts,
+        el("div", { class: "fields" }, [v.mult.node, v.max.node, v.loss.node]),
+        el("p", { class: "hint", text: "Example: master trades 2, multiplier 0.5 → follower trades 1. The max contracts in the follower's own follower.txt still applies as a hard cap on their computer." }),
+        el("div", { class: "actions" }, [v.save, v.toggle, v.pauseFlat]),
+      ]);
+      $("followers").appendChild(v.root);
+    }
+
+    let state, cls;
+    if (!f.connected) { state = "Offline"; cls = "bad"; }
+    else if (f.paused) { state = "Paused"; cls = "warn"; }
+    else if (f.mismatch) { state = "Position mismatch"; cls = "bad"; }
+    else { state = "Copying"; cls = "ok"; }
+    v.pill.textContent = state;
+    v.pill.className = "pill " + cls;
+
+    const pnl = el("span", { class: f.pnl < 0 ? "pos-short" : f.pnl > 0 ? "pos-long" : "", text: (f.pnl < 0 ? "−$" : "$") + Math.abs(f.pnl).toFixed(2) });
+    v.facts.replaceChildren(fact("Today's P&L", pnl), fact("Position", positionsText(f.positions)), fact("Follows", f.master));
+
+    if (!v.dirty) {
+      v.mult.input.value = f.multiplier;
+      v.max.input.value = f.max_contracts;
+      v.loss.input.value = f.daily_loss_limit;
+    }
+    v.toggle.textContent = f.paused ? "Resume copying" : "Pause copying";
+    v.toggle.onclick = () => (f.paused ? resume(id) : pause(id, false));
+  }
+
+  async function saveFollower(id) {
+    const v = followerViews[id];
+    const body = {
+      multiplier: parseFloat(v.mult.input.value),
+      max_contracts: parseInt(v.max.input.value, 10),
+      daily_loss_limit: parseFloat(v.loss.input.value || "0"),
+    };
+    if ([body.multiplier, body.max_contracts, body.daily_loss_limit].some((n) => Number.isNaN(n))) {
+      toast("Fill in all three numbers before saving.", true);
+      return;
+    }
+    try {
+      await api("/admin/followers/" + encodeURIComponent(id) + "/settings", "POST", body);
+      v.dirty = false;
+      v.save.disabled = true;
+      toast("Saved " + id + ".");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  }
+
+  async function pause(id, flatten) {
+    if (flatten && !confirm("Flatten " + id + " and stop copying to them?")) return;
+    try {
+      await api("/admin/pause/" + encodeURIComponent(id) + (flatten ? "?flatten=true" : ""), "POST");
+      toast(flatten ? id + " flattened and paused." : id + " paused.");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  }
+
+  async function resume(id) {
+    try {
+      await api("/admin/resume/" + encodeURIComponent(id), "POST");
+      toast(id + " is copying again. Open master trades aren't re-entered, only new ones.");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  }
+
+  // ---------- emergency ----------
+  $("killFollowers").addEventListener("click", async () => {
+    if (!confirm("Flatten every follower and pause copying?\n\nYour master account is not touched.")) return;
+    try { await api("/admin/kill", "POST"); toast("Followers flattened and paused."); refresh(); }
+    catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  });
+  $("killAll").addEventListener("click", async () => {
+    if (!confirm("Flatten EVERYTHING?\n\nEvery follower is flattened and paused, and your master account is flattened within about 5 seconds.")) return;
+    try {
+      const r = await api("/admin/kill-all", "POST");
+      toast(r.masters_offline && r.masters_offline.length
+        ? "Followers flattened. The master is offline, so flatten it by hand."
+        : "Everything flattened. The master closes within about 5 seconds.", !!(r.masters_offline && r.masters_offline.length));
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  });
+
+  // ---------- loop ----------
+  async function refresh() {
+    try {
+      const s = await api("/status");
+      Object.entries(s.masters).forEach(([id, m]) => renderMaster(id, m));
+      Object.entries(s.followers).forEach(([id, f]) => renderFollower(id, f));
+      if (!Object.keys(s.followers).length) $("followers").replaceChildren(el("p", { class: "hint", text: "No followers yet. Add them to config.json on Render." }));
+      $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+    } catch (e) {
+      if (e.message !== "unauthorized") $("updated").textContent = "Can't reach the server. Retrying…";
+    }
+  }
+
+  function start() {
+    $("login").hidden = true;
+    $("app").hidden = false;
+    refresh();
+    clearInterval(timer);
+    timer = setInterval(refresh, 3000);
+  }
+
+  $("loginForm").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    adminKey = $("keyInput").value.trim();
+    try { sessionStorage.setItem(KEY_STORE, adminKey); } catch (e) {}
+    start();
+  });
+  $("signout").addEventListener("click", () => signOut(""));
+
+  if (adminKey) start(); else signOut("");
+})();
+</script>
+</body>
+</html>
