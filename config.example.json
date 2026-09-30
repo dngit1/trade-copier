@@ -1,0 +1,15 @@
+{
+  "masters": [
+    { "id": "me", "key": "master-CHANGE-THIS-long-random-string" }
+  ],
+  "followers": [
+    {
+      "id": "test-sim102",
+      "key": "follower-CHANGE-THIS-long-random-string",
+      "master_id": "me",
+      "multiplier": 1.0,
+      "max_contracts": 2,
+      "daily_loss_limit": 500
+    }
+  ]
+}
