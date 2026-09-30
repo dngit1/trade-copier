@@ -225,6 +225,21 @@ async def health():
     return {"ok": True}
 
 
+# copymaster.<anything> opens the master page, copyfollower.<anything> the follower page.
+PAGE_BY_NAME = {"copymaster": "master.html", "copyfollower": "follower.html"}
+
+
+@app.get("/")
+async def home(request: Request):
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    page = PAGE_BY_NAME.get(host.split(".")[0])
+    if page:
+        return FileResponse(HERE / page, headers={"Cache-Control": "no-store"})
+    return PlainTextResponse("Trade copier server is running.")
+
+
 @app.get("/admin")
 async def admin_page():
     return FileResponse(HERE / "admin.html", headers={"Cache-Control": "no-store"})
