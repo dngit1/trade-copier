@@ -45,6 +45,25 @@
   .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom, 0)); transform: translateX(-50%);
     background: var(--ink); color: var(--surface); padding: 12px 18px; border-radius: 6px; font-weight: 600; max-width: calc(100% - 32px); }
   .toast.is-error { background: var(--bad); color: #fff; }
+
+  /* Compact pop-out window (?compact=1) */
+  body.compact { font-size: 15px; }
+  body.compact .wrap { padding: 12px 12px 14px; max-width: none; }
+  body.compact h1 { font-size: 20px; }
+  body.compact .sub { margin: 0 0 10px; font-size: 14px; }
+  body.compact .card { padding: 12px 14px; border-radius: 6px; }
+  body.compact .card + .card { margin-top: 8px; }
+  body.compact .big { font-size: 24px; }
+  body.compact h2 { font-size: 16px; margin-bottom: 6px; }
+  body.compact .btn { padding: 10px; font-size: 16px; margin-top: 10px; }
+  body.compact .btn.outline { margin-top: 6px; }
+  body.compact input, body.compact select { padding: 8px 10px; font-size: 16px; }
+  body.compact .muted { font-size: 13px; margin-top: 4px; }
+  body.compact dd { font-size: 17px; }
+  body.compact label.field + label.field { margin-top: 8px; }
+  body.compact .link { margin-top: 8px; }
+  body.compact .popout { display: none; }
+  .popout { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 14px; margin: 0 0 16px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -53,6 +72,7 @@
 <main class="wrap">
   <h1>Master Account</h1>
   <p class="sub">Choose which NinjaTrader account the followers copy.</p>
+  <button id="popout" class="popout" type="button">Open in small window</button>
 
   <form id="login" class="card" hidden>
     <label class="field">Master key (the <b>key=</b> line in master.txt)
@@ -164,6 +184,23 @@
       refresh();
     } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
   });
+
+
+  // ----- compact pop-out window -----
+  const isCompact = new URLSearchParams(location.search).get("compact") === "1";
+  if (isCompact) document.body.classList.add("compact");
+  $("popout").addEventListener("click", () => {
+    const w = window.open(location.pathname + "?compact=1", "copier-" + location.pathname.replace(/\W/g, ""),
+      "popup=yes,width=" + 380 + ",height=" + 520);
+    if (!w) toast("Your browser blocked the pop-up. Allow pop-ups for this site and try again.", true);
+  });
+  function fitWindow() {
+    if (!isCompact || !window.opener) return;
+    const chrome = window.outerHeight - window.innerHeight;
+    const want = Math.min(screen.availHeight - 20, document.querySelector("main").scrollHeight + chrome);
+    if (Math.abs(window.outerHeight - want) > 4) { try { window.resizeTo(window.outerWidth, want); } catch (e) {} }
+  }
+  if (isCompact && "ResizeObserver" in window) new ResizeObserver(fitWindow).observe(document.querySelector("main"));
 
   function start() {
     $("login").hidden = true; $("app").hidden = false;
