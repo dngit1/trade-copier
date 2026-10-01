@@ -530,7 +530,7 @@ async def my_master_status(x_master_key: Optional[str] = Header(default=None)):
         "account": ms["account"],
         "accounts": ms["accounts"],
         "switching_to": switching,
-        "followers_connected": sum(1 for fs in FOLLOWERS if fs.cfg["master_id"] == master["id"] and fs.ws is not None),
+        "followers_connected": any(fs.cfg["master_id"] == master["id"] and fs.ws is not None for fs in FOLLOWERS),
     }
 
 

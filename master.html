@@ -146,7 +146,7 @@
     st.className = "status " + (s.online ? "good" : "bad");
     st.lastElementChild.textContent = s.online ? "NinjaTrader connected" : "NinjaTrader not connected";
     $("statusNote").textContent = s.online
-      ? s.followers_connected + (s.followers_connected === 1 ? " follower" : " followers") + " connected"
+      ? (s.followers_connected ? "Followers connected" : "No followers connected")
       : "Open NinjaTrader on the master computer to change accounts.";
 
     $("current").textContent = s.account || "Not reported yet";
