@@ -286,12 +286,19 @@
       v.max = numberField("Max contracts", "max-" + id, "1", "1");
       v.loss = numberField("Daily loss limit ($, 0 = off)", "loss-" + id, "50", "0");
       [v.mult, v.max, v.loss].forEach((fld) => fld.input.addEventListener("input", () => { v.dirty = true; v.save.disabled = false; }));
+      v.acctSelect = el("select", { id: "acct-f-" + id });
+      v.acctBtn = el("button", { class: "btn", type: "button", text: "Switch account", onclick: () => switchFollowerAccount(id) });
+      v.acctSelect.addEventListener("change", () => updateFollowerAcctBtn(id));
       v.save = el("button", { class: "btn primary", type: "button", text: "Save changes", disabled: "", onclick: () => saveFollower(id) });
       v.toggle = el("button", { class: "btn", type: "button" });
       v.pauseFlat = el("button", { class: "btn danger", type: "button", text: "Pause and flatten", onclick: () => pause(id, true) });
       v.root = el("div", { class: "panel" }, [
         el("div", { class: "row-head" }, [el("h3", { text: id }), v.pill]),
         v.facts,
+        el("div", { class: "fields" }, [
+          el("label", { class: "field", for: "acct-f-" + id }, [document.createTextNode("Copy into account"), v.acctSelect]),
+        ]),
+        el("div", { class: "actions" }, [v.acctBtn]),
         el("div", { class: "fields" }, [v.mult.node, v.max.node, v.loss.node]),
         el("p", { class: "hint", text: "Example: master trades 1, multiplier 3 → follower trades 3 (up to max contracts). The max contracts in the follower's own follower.txt still applies as a hard cap on their computer." }),
         el("div", { class: "actions" }, [v.save, v.toggle, v.pauseFlat]),
@@ -308,7 +315,24 @@
     v.pill.className = "pill " + cls;
 
     const pnl = el("span", { class: f.pnl < 0 ? "pos-short" : f.pnl > 0 ? "pos-long" : "", text: (f.pnl < 0 ? "−$" : "$") + Math.abs(f.pnl).toFixed(2) });
-    v.facts.replaceChildren(fact("Today's P&L", pnl), fact("Position", positionsText(f.positions)), fact("Follows", f.master));
+    v.facts.replaceChildren(
+      fact("Account", f.account || (f.connected ? "Not found" : "–")),
+      fact("Today's P&L", pnl),
+      fact("Position", positionsText(f.positions)),
+      fact("Follows", f.master),
+    );
+    v.data = f;
+    if (document.activeElement !== v.acctSelect) {
+      const keep = v.acctSelect.value;
+      v.acctSelect.replaceChildren(...(f.accounts || []).map((a) => el("option", { value: a, text: a + (a === f.account ? "  (current)" : "") })));
+      v.acctSelect.value = (f.accounts || []).includes(keep) ? keep : (f.account || "");
+    }
+    if (v.pending && (f.account === v.pending.to || Date.now() - v.pending.at > 20000)) {
+      if (f.account !== v.pending.to) toast(id + ": " + (f.last_error || "the account switch didn't go through."), true);
+      v.pending = null;
+    }
+    v.acctBtn.textContent = v.pending ? "Switching…" : "Switch account";
+    updateFollowerAcctBtn(id);
 
     if (!v.dirty) {
       v.mult.input.value = f.multiplier;
@@ -317,6 +341,25 @@
     }
     v.toggle.textContent = f.paused ? "Resume copying" : "Pause copying";
     v.toggle.onclick = () => (f.paused ? resume(id) : pause(id, false));
+  }
+
+  function updateFollowerAcctBtn(id) {
+    const v = followerViews[id], f = v && v.data;
+    if (!f) return;
+    const sel = v.acctSelect.value;
+    v.acctBtn.disabled = !f.connected || !sel || sel === f.account || !!v.pending;
+  }
+
+  async function switchFollowerAccount(id) {
+    const v = followerViews[id];
+    const account = v.acctSelect.value;
+    if (!confirm("Copy trades for " + id + " into " + account + " from now on?\n\nAnything open in their current account stays open and is no longer managed by the copier.")) return;
+    try {
+      await api("/admin/followers/" + encodeURIComponent(id) + "/account", "POST", { account });
+      v.pending = { to: account, at: Date.now() };
+      toast("Switching " + id + " to " + account + "…");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
   }
 
   async function saveFollower(id) {

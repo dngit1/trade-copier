@@ -383,6 +383,9 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
                 "positions": fs.positions,
                 "master": fs.cfg["master_id"],
                 "mismatch": fs.strikes >= RECON_STRIKES,
+                "account": fs.account,
+                "accounts": fs.accounts,
+                "last_error": fs.last_error if time.time() - fs.last_error_at < 60 else None,
                 "multiplier": float(fs.cfg.get("multiplier", 1.0)),
                 "max_contracts": int(fs.cfg.get("max_contracts", 1)),
                 "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
@@ -584,19 +587,30 @@ async def my_follower_settings(body: dict = Body(...), x_follower_key: Optional[
     return {"ok": True}
 
 
-@app.post("/me/follower/account")
-async def my_follower_account(body: dict = Body(...), x_follower_key: Optional[str] = Header(default=None)):
-    fs = follower_from_key(x_follower_key)
+async def request_follower_account(fs: FollowerState, body: dict, changed_by: str) -> dict:
     if fs.ws is None:
-        raise HTTPException(status_code=409, detail="Your NinjaTrader isn't connected, so the account can't be changed right now.")
+        raise HTTPException(status_code=409, detail="That follower's NinjaTrader isn't connected, so the account can't be changed right now.")
     account = str(body.get("account", "")).strip()
     if not account or "|" in account:
         raise HTTPException(status_code=400, detail="Pick an account first.")
     if fs.accounts and account not in fs.accounts:
-        raise HTTPException(status_code=400, detail=f"{account} isn't connected in your NinjaTrader.")
+        raise HTTPException(status_code=400, detail=f"{account} isn't connected in that follower's NinjaTrader.")
     await send(fs, "account", account)
-    await alert(f"{fs.id} switching follower account to {account} (was {fs.account})")
+    await alert(f"{fs.id} switching follower account to {account} (was {fs.account}), by {changed_by}")
     return {"ok": True}
+
+
+@app.post("/me/follower/account")
+async def my_follower_account(body: dict = Body(...), x_follower_key: Optional[str] = Header(default=None)):
+    fs = follower_from_key(x_follower_key)
+    return await request_follower_account(fs, body, fs.id)
+
+
+@app.post("/admin/followers/{follower_id}/account")
+async def admin_follower_account(follower_id: str, body: dict = Body(...),
+                                 x_admin_key: Optional[str] = Header(default=None)):
+    require_admin(x_admin_key)
+    return await request_follower_account(get_follower(follower_id), body, "admin")
 
 
 @app.post("/me/follower/stop")
