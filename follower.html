@@ -126,9 +126,13 @@
     <form id="settings" class="card">
       <h2>My settings</h2>
       <label class="field">Size multiplier
-        <input id="mult" type="number" step="0.1" min="0.1" max="50" inputmode="decimal" required>
+        <input id="mult" type="number" step="1" min="1" max="50" inputmode="numeric" required>
       </label>
-      <p class="muted">1 = same size as the master. 0.5 = half size. 2 = double size.</p>
+      <p class="muted">1 = same size as the master, 2 = double, 3 = triple.</p>
+      <label class="field">Max contracts per order
+        <input id="maxc" type="number" step="1" min="1" max="500" inputmode="numeric" required>
+      </label>
+      <p class="muted">Copied orders are never larger than this, whatever the multiplier.</p>
       <label class="field">Daily loss limit ($)
         <input id="loss" type="number" step="50" min="0" inputmode="decimal" required>
       </label>
@@ -204,7 +208,7 @@
 
     const m = s.master;
     $("masterStatus").className = "status " + (m.online ? "t-good" : "t-bad");
-    $("masterStatus").lastElementChild.textContent = m.name + (m.online ? " is online" : " is offline");
+    $("masterStatus").lastElementChild.textContent = m.online ? "Master is online" : "Master is offline";
     $("masterNote").textContent = m.online
       ? "Master's trade at your size: " + posText(m.positions)
       : "No trades will be copied until the master is back online.";
@@ -216,8 +220,9 @@
 
     renderAccount(s);
 
-    if (!dirty && document.activeElement !== $("mult") && document.activeElement !== $("loss")) {
+    if (!dirty && !["mult", "maxc", "loss"].includes(document.activeElement && document.activeElement.id)) {
       $("mult").value = s.multiplier;
+      $("maxc").value = s.max_contracts;
       $("loss").value = s.daily_loss_limit;
     }
   }
@@ -266,12 +271,18 @@
     catch (e) { if (e.message !== "unauthorized") $("stateNote").textContent = "Can't reach the server. Retrying…"; }
   }
 
-  ["mult", "loss"].forEach((id) => $(id).addEventListener("input", () => { dirty = true; $("saveBtn").disabled = false; }));
+  ["mult", "maxc", "loss"].forEach((id) => $(id).addEventListener("input", () => { dirty = true; $("saveBtn").disabled = false; }));
 
   $("settings").addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    const body = { multiplier: parseFloat($("mult").value), daily_loss_limit: parseFloat($("loss").value || "0") };
-    if (Number.isNaN(body.multiplier) || Number.isNaN(body.daily_loss_limit)) { toast("Please enter numbers only.", true); return; }
+    const body = {
+      multiplier: Number($("mult").value),
+      max_contracts: Number($("maxc").value),
+      daily_loss_limit: parseFloat($("loss").value || "0"),
+    };
+    if (!Number.isInteger(body.multiplier) || body.multiplier < 1) { toast("The multiplier must be a whole number: 1, 2, 3…", true); return; }
+    if (!Number.isInteger(body.max_contracts) || body.max_contracts < 1) { toast("Max contracts must be a whole number of at least 1.", true); return; }
+    if (Number.isNaN(body.daily_loss_limit)) { toast("Please enter numbers only.", true); return; }
     try {
       await api("/me/follower/settings", "POST", body);
       dirty = false; $("saveBtn").disabled = true;

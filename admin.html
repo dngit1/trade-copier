@@ -282,7 +282,7 @@
       v = followerViews[id] = { dirty: false };
       v.pill = el("span", { class: "pill" });
       v.facts = el("dl", { class: "facts" });
-      v.mult = numberField("Size multiplier", "mult-" + id, "0.1", "0.1");
+      v.mult = numberField("Size multiplier", "mult-" + id, "1", "1");
       v.max = numberField("Max contracts", "max-" + id, "1", "1");
       v.loss = numberField("Daily loss limit ($, 0 = off)", "loss-" + id, "50", "0");
       [v.mult, v.max, v.loss].forEach((fld) => fld.input.addEventListener("input", () => { v.dirty = true; v.save.disabled = false; }));
@@ -293,7 +293,7 @@
         el("div", { class: "row-head" }, [el("h3", { text: id }), v.pill]),
         v.facts,
         el("div", { class: "fields" }, [v.mult.node, v.max.node, v.loss.node]),
-        el("p", { class: "hint", text: "Example: master trades 2, multiplier 0.5 → follower trades 1. The max contracts in the follower's own follower.txt still applies as a hard cap on their computer." }),
+        el("p", { class: "hint", text: "Example: master trades 1, multiplier 3 → follower trades 3 (up to max contracts). The max contracts in the follower's own follower.txt still applies as a hard cap on their computer." }),
         el("div", { class: "actions" }, [v.save, v.toggle, v.pauseFlat]),
       ]);
       $("followers").appendChild(v.root);

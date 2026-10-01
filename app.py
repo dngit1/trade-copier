@@ -396,9 +396,10 @@ def validate_settings(body: dict, fields: tuple) -> dict:
     out = {}
     try:
         if "multiplier" in fields:
-            out["multiplier"] = float(body["multiplier"])
-            if not 0 < out["multiplier"] <= 50:
-                raise HTTPException(status_code=400, detail="The multiplier must be above 0 and at most 50.")
+            m = float(body["multiplier"])
+            if not m.is_integer() or not 1 <= m <= 50:
+                raise HTTPException(status_code=400, detail="The multiplier must be a whole number from 1 to 50.")
+            out["multiplier"] = int(m)
         if "max_contracts" in fields:
             out["max_contracts"] = int(body["max_contracts"])
             if not 1 <= out["max_contracts"] <= 500:
@@ -565,6 +566,7 @@ async def my_follower_status(x_follower_key: Optional[str] = Header(default=None
         "accounts": fs.accounts,
         "last_error": fs.last_error if time.time() - fs.last_error_at < 60 else None,
         "multiplier": float(fs.cfg.get("multiplier", 1.0)),
+        "max_contracts": int(fs.cfg.get("max_contracts", 1)),
         "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
         "master": {
             "name": fs.cfg["master_id"],
@@ -578,7 +580,7 @@ async def my_follower_status(x_follower_key: Optional[str] = Header(default=None
 @app.post("/me/follower/settings")
 async def my_follower_settings(body: dict = Body(...), x_follower_key: Optional[str] = Header(default=None)):
     fs = follower_from_key(x_follower_key)
-    await apply_settings(fs, validate_settings(body, ("multiplier", "daily_loss_limit")), fs.id)
+    await apply_settings(fs, validate_settings(body, ("multiplier", "max_contracts", "daily_loss_limit")), fs.id)
     return {"ok": True}
 
 
