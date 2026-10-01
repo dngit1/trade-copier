@@ -64,6 +64,8 @@
   body.compact .link { margin-top: 8px; }
   body.compact .popout { display: none; }
   .popout { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 14px; margin: 0 0 16px; }
+  .muted.good { color: var(--good); font-weight: 600; }
+  .muted.bad { color: var(--bad); font-weight: 600; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -145,6 +147,7 @@
     const st = $("status");
     st.className = "status " + (s.online ? "good" : "bad");
     st.lastElementChild.textContent = s.online ? "NinjaTrader connected" : "NinjaTrader not connected";
+    $("statusNote").className = "muted" + (s.online ? (s.followers_connected ? " good" : " bad") : "");
     $("statusNote").textContent = s.online
       ? (s.followers_connected ? "Followers connected" : "No followers connected")
       : "Open NinjaTrader on the master computer to change accounts.";
