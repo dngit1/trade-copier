@@ -89,6 +89,10 @@ class FollowerState:
         self.last_hb = 0.0
         self.pnl = 0.0
         self.positions: dict = {}
+        self.account: Optional[str] = None
+        self.accounts: list = []
+        self.last_error: Optional[str] = None
+        self.last_error_at = 0.0
         self.strikes = 0
         self.stale_alerted = False
 
@@ -314,10 +318,16 @@ async def follower_socket(ws: WebSocket):
                 fs.last_hb = time.time()
                 fs.pnl = float(parts[1])
                 fs.positions = parse_positions(parts[2])
+                if len(parts) > 3:
+                    fs.account = parts[3] or None
+                if len(parts) > 4:
+                    fs.accounts = sorted(a for a in parts[4].split(",") if a)
                 await check_loss_limit(fs)
             elif parts[0] == "ack":
                 log_event("ack", fs.id, text)
                 if len(parts) > 2 and parts[2] == "err":
+                    fs.last_error = "|".join(parts[3:])
+                    fs.last_error_at = time.time()
                     await alert(f"{fs.id} rejected seq {parts[1]}: {'|'.join(parts[3:])}")
     except WebSocketDisconnect:
         pass
@@ -551,6 +561,9 @@ async def my_follower_status(x_follower_key: Optional[str] = Header(default=None
         "paused": fs.paused,
         "pnl": fs.pnl,
         "positions": fs.positions,
+        "account": fs.account,
+        "accounts": fs.accounts,
+        "last_error": fs.last_error if time.time() - fs.last_error_at < 60 else None,
         "multiplier": float(fs.cfg.get("multiplier", 1.0)),
         "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
         "master": {
@@ -566,6 +579,21 @@ async def my_follower_status(x_follower_key: Optional[str] = Header(default=None
 async def my_follower_settings(body: dict = Body(...), x_follower_key: Optional[str] = Header(default=None)):
     fs = follower_from_key(x_follower_key)
     await apply_settings(fs, validate_settings(body, ("multiplier", "daily_loss_limit")), fs.id)
+    return {"ok": True}
+
+
+@app.post("/me/follower/account")
+async def my_follower_account(body: dict = Body(...), x_follower_key: Optional[str] = Header(default=None)):
+    fs = follower_from_key(x_follower_key)
+    if fs.ws is None:
+        raise HTTPException(status_code=409, detail="Your NinjaTrader isn't connected, so the account can't be changed right now.")
+    account = str(body.get("account", "")).strip()
+    if not account or "|" in account:
+        raise HTTPException(status_code=400, detail="Pick an account first.")
+    if fs.accounts and account not in fs.accounts:
+        raise HTTPException(status_code=400, detail=f"{account} isn't connected in your NinjaTrader.")
+    await send(fs, "account", account)
+    await alert(f"{fs.id} switching follower account to {account} (was {fs.account})")
     return {"ok": True}
 
 

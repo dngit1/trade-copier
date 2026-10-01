@@ -23,7 +23,7 @@
   body { font-family: "Barlow", "Segoe UI", system-ui, sans-serif; font-size: 17px; line-height: 1.45;
     padding: env(safe-area-inset-top, 0) 0 env(safe-area-inset-bottom, 0); font-variant-numeric: tabular-nums; }
   h1, h2, .big { font-family: "Barlow Semi Condensed", "Barlow", system-ui, sans-serif; }
-  button, input { font: inherit; color: inherit; }
+  button, input, select { font: inherit; color: inherit; }
   :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
   .wrap { max-width: 520px; margin: 0 auto; padding: 28px 18px 40px; }
   h1 { font-size: 30px; margin: 0; font-weight: 700; }
@@ -43,7 +43,7 @@
   dt { color: var(--muted); font-size: 15px; } dd { margin: 0; font-size: 20px; font-weight: 600; }
   label.field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 15px; }
   label.field + label.field { margin-top: 14px; }
-  input { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 6px; padding: 12px; font-size: 18px; width: 100%; }
+  input, select { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 6px; padding: 12px; font-size: 18px; width: 100%; }
   .btn { width: 100%; margin-top: 14px; border: 0; border-radius: 6px; padding: 14px; font-weight: 700; font-size: 18px; cursor: pointer; background: var(--ink); color: var(--surface); }
   .btn.stop { background: var(--bad); color: #fff; }
   .btn.outline { background: transparent; color: var(--bad); border: 2px solid var(--bad); margin-top: 10px; }
@@ -112,6 +112,17 @@
       </dl>
     </div>
 
+    <div class="card">
+      <h2>My account</h2>
+      <div class="muted" style="margin:0">Trades are copied into</div>
+      <p id="curAccount" class="big" style="font-size:26px;word-break:break-word">–</p>
+      <label class="field" for="acctSelect" style="margin-top:10px">Change to
+        <select id="acctSelect"></select>
+      </label>
+      <button id="acctBtn" class="btn" type="button" disabled>Switch account</button>
+      <p id="acctNote" class="muted">Switch while you're flat. Positions in the old account stay as they are.</p>
+    </div>
+
     <form id="settings" class="card">
       <h2>My settings</h2>
       <label class="field">Size multiplier
@@ -135,7 +146,7 @@
 (function () {
   const STORE = "copierFollowerKey";
   const $ = (id) => document.getElementById(id);
-  let key = null, timer = null, last = null, dirty = false, toastTimer = null;
+  let key = null, timer = null, last = null, dirty = false, toastTimer = null, pendingSwitch = null;
   try { key = sessionStorage.getItem(STORE); } catch (e) {}
 
   function toast(msg, isError) {
@@ -203,11 +214,52 @@
     pnl.className = s.pnl < 0 ? "t-bad" : s.pnl > 0 ? "t-good" : "";
     $("myPos").textContent = posText(s.positions);
 
+    renderAccount(s);
+
     if (!dirty && document.activeElement !== $("mult") && document.activeElement !== $("loss")) {
       $("mult").value = s.multiplier;
       $("loss").value = s.daily_loss_limit;
     }
   }
+
+  function renderAccount(s) {
+    $("curAccount").textContent = s.account || (s.ninjatrader_connected ? "Account not found" : "–");
+    const sel = $("acctSelect");
+    if (document.activeElement !== sel) {
+      const keep = sel.value;
+      sel.replaceChildren(...(s.accounts || []).map((a) => {
+        const o = document.createElement("option"); o.value = a; o.textContent = a + (a === s.account ? "  (current)" : ""); return o;
+      }));
+      sel.value = (s.accounts || []).includes(keep) ? keep : (s.account || "");
+    }
+    if (pendingSwitch && (s.account === pendingSwitch.to || Date.now() - pendingSwitch.at > 20000)) {
+      if (s.account !== pendingSwitch.to) toast(s.last_error || "The switch didn't go through. Check that NinjaTrader is running.", true);
+      pendingSwitch = null;
+    }
+    const note = $("acctNote");
+    if (pendingSwitch) note.textContent = "Switching to " + pendingSwitch.to + "… (a few seconds)";
+    else if (!s.ninjatrader_connected) note.textContent = "Open NinjaTrader on your computer to change accounts.";
+    else note.textContent = "Switch while you're flat. Positions in the old account stay as they are.";
+    updateAcctButton();
+  }
+
+  function updateAcctButton() {
+    const s = last;
+    const v = $("acctSelect").value;
+    $("acctBtn").disabled = !s || !s.ninjatrader_connected || !v || v === s.account || !!pendingSwitch;
+  }
+
+  $("acctSelect").addEventListener("change", updateAcctButton);
+  $("acctBtn").addEventListener("click", async () => {
+    const account = $("acctSelect").value;
+    if (!confirm("Copy trades into " + account + " from now on?\n\nAnything open in your current account stays open and is no longer managed by the copier.")) return;
+    try {
+      await api("/me/follower/account", "POST", { account });
+      pendingSwitch = { to: account, at: Date.now() };
+      toast("Switching to " + account + "…");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  });
 
   async function refresh() {
     try { render(await api("/me/follower")); }
