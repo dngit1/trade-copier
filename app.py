@@ -310,10 +310,14 @@ async def follower_socket(ws: WebSocket):
     fs.last_hb = time.time()
     log.info("Follower %s connected", fs.id)
     log_event("connect", fs.id, "")
+    first_hb = True
     try:
         while True:
             text = await ws.receive_text()
             parts = text.split("|")
+            if parts[0] == "hb" and first_hb:
+                first_hb = False
+                log.info("Follower %s first heartbeat: %s", fs.id, text[:300])
             if parts[0] == "hb" and len(parts) >= 3:
                 fs.last_hb = time.time()
                 fs.pnl = float(parts[1])
