@@ -31,7 +31,9 @@ import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -48,6 +50,14 @@ DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 MASTER_TIMEOUT_SEC = 15         # no heartbeat for this long -> master offline alert
 FOLLOWER_TIMEOUT_SEC = 15
 MASTER_COMMAND_EXPIRY_SEC = 60  # a queued master command is dropped if the master doesn't pick it up in time
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def trading_day() -> str:
+    """CME futures sessions start at 6 pm New York time, so 6 pm counts as the start of the next trading day."""
+    return (datetime.now(NEW_YORK) + timedelta(hours=6)).date().isoformat()
+
+
 RECON_STRIKES = 3               # consecutive 5s checks with mismatched positions before alerting
 
 with open(CONFIG_PATH) as f:
@@ -86,6 +96,8 @@ class FollowerState:
         self.id = cfg["id"]
         self.ws: Optional[WebSocket] = None
         self.paused = False
+        self.pause_reason: Optional[str] = None   # "loss_limit" or "manual"
+        self.loss_day: Optional[str] = None       # trading day the loss limit was hit
         self.last_hb = 0.0
         self.pnl = 0.0
         self.positions: dict = {}
@@ -185,6 +197,22 @@ def master_reply(master_id: str, ms: dict) -> PlainTextResponse:
     return PlainTextResponse("ok")
 
 
+async def maybe_auto_resume(fs: "FollowerState", now: float) -> None:
+    """A follower paused by the daily loss limit starts copying again in the next trading session,
+    once its NinjaTrader reports a fresh P&L that is back above the limit."""
+    if not (fs.paused and fs.pause_reason == "loss_limit") or trading_day() == fs.loss_day:
+        return
+    if fs.ws is None or now - fs.last_hb > FOLLOWER_TIMEOUT_SEC:
+        return  # wait for a fresh heartbeat so the P&L is today's
+    limit = float(fs.cfg.get("daily_loss_limit") or 0)
+    if limit > 0 and fs.pnl <= -limit:
+        return  # NinjaTrader hasn't reset the day's P&L yet; check again in 5 seconds
+    fs.paused = False
+    fs.pause_reason = None
+    fs.strikes = 0
+    await alert(f"{fs.id}: new trading session, copying resumed automatically after yesterday's loss limit")
+
+
 async def monitor() -> None:
     while True:
         await asyncio.sleep(5)
@@ -194,6 +222,7 @@ async def monitor() -> None:
                 ms["offline_alerted"] = True
                 await alert(f"Master {mid} stopped sending heartbeats")
         for fs in FOLLOWERS:
+            await maybe_auto_resume(fs, now)
             if fs.ws is None or fs.paused:
                 fs.strikes = 0
                 continue
@@ -345,8 +374,10 @@ async def check_loss_limit(fs: FollowerState) -> None:
     limit = float(fs.cfg.get("daily_loss_limit") or 0)
     if limit > 0 and fs.pnl <= -limit and not fs.paused:
         fs.paused = True
+        fs.pause_reason = "loss_limit"
+        fs.loss_day = trading_day()
         await send(fs, "flatten", "ALL")
-        await alert(f"{fs.id} hit daily loss limit (P&L {fs.pnl:.2f}); flattened and paused")
+        await alert(f"{fs.id} hit daily loss limit (P&L {fs.pnl:.2f}); flattened and paused until the next session (6 pm ET)")
 
 
 # ---------------- admin ----------------
@@ -383,6 +414,7 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
             fs.id: {
                 "connected": fs.ws is not None,
                 "paused": fs.paused,
+                "pause_reason": fs.pause_reason,
                 "pnl": fs.pnl,
                 "positions": fs.positions,
                 "master": fs.cfg["master_id"],
@@ -461,6 +493,7 @@ async def kill_switch(x_admin_key: Optional[str] = Header(default=None)):
     require_admin(x_admin_key)
     for fs in FOLLOWERS:
         fs.paused = True
+        fs.pause_reason = "manual"
         await send(fs, "flatten", "ALL")
     await alert("KILL SWITCH: all followers flattened and paused")
     return {"ok": True}
@@ -472,6 +505,7 @@ async def kill_all(x_admin_key: Optional[str] = Header(default=None)):
     require_admin(x_admin_key)
     for fs in FOLLOWERS:
         fs.paused = True
+        fs.pause_reason = "manual"
         await send(fs, "flatten", "ALL")
     now = time.time()
     offline = []
@@ -489,6 +523,7 @@ async def pause(follower_id: str, flatten: bool = False, x_admin_key: Optional[s
     require_admin(x_admin_key)
     fs = get_follower(follower_id)
     fs.paused = True
+    fs.pause_reason = "manual"
     if flatten:
         await send(fs, "flatten", "ALL")
     await alert(f"{fs.id} paused (flatten={flatten})")
@@ -500,6 +535,7 @@ async def resume(follower_id: str, x_admin_key: Optional[str] = Header(default=N
     require_admin(x_admin_key)
     fs = get_follower(follower_id)
     fs.paused = False
+    fs.pause_reason = None
     fs.strikes = 0
     await alert(f"{fs.id} resumed")
     return {"ok": True}
@@ -567,6 +603,7 @@ async def my_follower_status(x_follower_key: Optional[str] = Header(default=None
         "ninjatrader_connected": fs.ws is not None,
         "copying": fs.ws is not None and not fs.paused,
         "paused": fs.paused,
+        "pause_reason": fs.pause_reason,
         "pnl": fs.pnl,
         "positions": fs.positions,
         "account": fs.account,
@@ -621,6 +658,7 @@ async def admin_follower_account(follower_id: str, body: dict = Body(...),
 async def my_follower_stop(flatten: bool = False, x_follower_key: Optional[str] = Header(default=None)):
     fs = follower_from_key(x_follower_key)
     fs.paused = True
+    fs.pause_reason = "manual"
     if flatten:
         await send(fs, "flatten", "ALL")
     await alert(f"{fs.id} stopped copying from the follower page (closed positions: {flatten})")
@@ -631,6 +669,7 @@ async def my_follower_stop(flatten: bool = False, x_follower_key: Optional[str] 
 async def my_follower_start(x_follower_key: Optional[str] = Header(default=None)):
     fs = follower_from_key(x_follower_key)
     fs.paused = False
+    fs.pause_reason = None
     fs.strikes = 0
     await alert(f"{fs.id} resumed copying from the follower page")
     await check_loss_limit(fs)

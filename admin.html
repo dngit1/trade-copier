@@ -308,6 +308,7 @@
 
     let state, cls;
     if (!f.connected) { state = "Offline"; cls = "bad"; }
+    else if (f.paused && f.pause_reason === "loss_limit") { state = "Paused: loss limit (resumes 6 pm ET)"; cls = "warn"; }
     else if (f.paused) { state = "Paused"; cls = "warn"; }
     else if (f.mismatch) { state = "Position mismatch"; cls = "bad"; }
     else { state = "Copying"; cls = "ok"; }

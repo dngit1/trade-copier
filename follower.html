@@ -193,9 +193,12 @@
     if (!s.ninjatrader_connected) {
       cls = "bad"; text = "Not connected";
       note = "NinjaTrader on your computer isn't connected to the copier. Open NinjaTrader and check your internet.";
+    } else if (s.paused && s.pause_reason === "loss_limit") {
+      cls = "amber"; text = "Stopped for today";
+      note = "Your daily loss limit was reached, so your positions were closed. Copying starts again automatically at the next session (6 pm ET).";
     } else if (s.paused) {
       cls = "amber"; text = "Stopped";
-      note = "New trades from the master are not being copied. If you hit your daily loss limit, copying stopped automatically.";
+      note = "New trades from the master are not being copied.";
     } else {
       cls = "good"; text = "Copying";
       note = "New trades from the master are copied to your account.";
