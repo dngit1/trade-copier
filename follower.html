@@ -102,6 +102,9 @@
       <h2>Master</h2>
       <div id="masterStatus" class="status"><span class="dot"></span><span>Checking…</span></div>
       <p id="masterNote" class="muted"></p>
+      <p id="mismatchNote" class="muted t-bad" style="font-weight:600" hidden>Your position doesn't match the master's.</p>
+      <button id="syncBtn" class="btn" type="button">Sync to master</button>
+      <p class="muted">Cancels your copied orders, trades the difference at market so your position matches the master's, then places the master's stop and target orders for you.</p>
     </div>
 
     <div class="card">
@@ -220,6 +223,8 @@
     pnl.textContent = (s.pnl < 0 ? "−$" : "$") + Math.abs(s.pnl).toFixed(2);
     pnl.className = s.pnl < 0 ? "t-bad" : s.pnl > 0 ? "t-good" : "";
     $("myPos").textContent = posText(s.positions);
+    $("mismatchNote").hidden = !s.mismatch;
+    $("syncBtn").disabled = !m.online || !s.ninjatrader_connected || (s.paused && s.pause_reason === "loss_limit");
 
     renderAccount(s);
 
@@ -267,6 +272,20 @@
       toast("Switching to " + account + "…");
       refresh();
     } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  });
+
+
+  function orderText(o) {
+    const side = /buy/i.test(o.action) ? "Buy" : "Sell";
+    const type = o.type === "StopMarket" ? "Stop" : o.type === "StopLimit" ? "Stop limit" : o.type;
+    const price = o.type === "Market" ? "" : " @ " + (/stop/i.test(o.type) ? o.stop : o.limit);
+    return side + " " + o.qty + " " + o.instrument + " " + type + price;
+  }
+
+  $("syncBtn").addEventListener("click", async () => {
+    if (!confirm("Match the master now?\n\nYour working orders are cancelled, the difference is traded AT MARKET, and the master's stop/target orders are placed in your account.")) return;
+    try { await api("/me/follower/sync", "POST"); toast("Syncing to the master…"); refresh(); }
+    catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
   });
 
   async function refresh() {

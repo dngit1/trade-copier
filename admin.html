@@ -61,7 +61,7 @@
 
   .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 20px; margin: 14px 0 0; }
   .facts dt { color: var(--muted); font-size: 14px; }
-  .facts dd { margin: 0; font-size: 20px; font-weight: 600; }
+  .facts dd { margin: 0; font-size: 20px; font-weight: 600; white-space: pre-line; }
   .pos-long { color: var(--long); } .pos-short { color: var(--short); }
 
   .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 16px; }
@@ -240,6 +240,7 @@
       fact("Copying from", m.account || "Not reported yet"),
       fact("Position", positionsText(m.positions)),
       fact("Last heartbeat", m.seconds_since_hb == null ? "Never" : m.seconds_since_hb + "s ago"),
+      fact("Working orders", (m.orders || []).length ? m.orders.map(orderText).join("\n") : "None"),
     );
 
     const accounts = m.accounts || [];
@@ -292,6 +293,7 @@
       v.save = el("button", { class: "btn primary", type: "button", text: "Save changes", disabled: "", onclick: () => saveFollower(id) });
       v.toggle = el("button", { class: "btn", type: "button" });
       v.pauseFlat = el("button", { class: "btn danger", type: "button", text: "Pause and flatten", onclick: () => pause(id, true) });
+      v.sync = el("button", { class: "btn", type: "button", text: "Sync to master", onclick: () => syncFollower(id) });
       v.root = el("div", { class: "panel" }, [
         el("div", { class: "row-head" }, [el("h3", { text: id }), v.pill]),
         v.facts,
@@ -301,7 +303,7 @@
         el("div", { class: "actions" }, [v.acctBtn]),
         el("div", { class: "fields" }, [v.mult.node, v.max.node, v.loss.node]),
         el("p", { class: "hint", text: "Example: master trades 1, multiplier 3 → follower trades 3 (up to max contracts). The max contracts in the follower's own follower.txt still applies as a hard cap on their computer." }),
-        el("div", { class: "actions" }, [v.save, v.toggle, v.pauseFlat]),
+        el("div", { class: "actions" }, [v.save, v.toggle, v.sync, v.pauseFlat]),
       ]);
       $("followers").appendChild(v.root);
     }
@@ -361,6 +363,20 @@
       toast("Switching " + id + " to " + account + "…");
       refresh();
     } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  }
+
+
+  function orderText(o) {
+    const side = /buy/i.test(o.action) ? "Buy" : "Sell";
+    const type = o.type === "StopMarket" ? "Stop" : o.type === "StopLimit" ? "Stop limit" : o.type;
+    const price = o.type === "Market" ? "" : " @ " + (/stop/i.test(o.type) ? o.stop : o.limit);
+    return side + " " + o.qty + " " + o.instrument + " " + type + price;
+  }
+
+  async function syncFollower(id) {
+    if (!confirm("Sync " + id + " to the master?\n\nTheir working orders are cancelled, the difference is traded AT MARKET, and the master's stop/target orders are placed in their account.")) return;
+    try { await api("/admin/followers/" + encodeURIComponent(id) + "/sync", "POST"); toast("Syncing " + id + "…"); refresh(); }
+    catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
   }
 
   async function saveFollower(id) {

@@ -112,7 +112,7 @@ class FollowerState:
 MASTERS = {m["key"]: m for m in CFG["masters"]}
 MASTER_STATE = {
     m["id"]: {"last_hb": 0.0, "positions": {}, "offline_alerted": False,
-              "account": None, "accounts": [], "commands": []}
+              "account": None, "accounts": [], "commands": [], "orders": []}
     for m in CFG["masters"]
 }
 FOLLOWERS = [FollowerState(fc) for fc in CFG["followers"]]
@@ -139,6 +139,24 @@ def parse_positions(text: str) -> dict:
         if inst:
             out[inst] = int(qty)
     return out
+
+
+ORDER_FIELDS = ("id", "instrument", "action", "type", "qty", "limit", "stop", "oco", "tif")
+
+
+def parse_orders(text: str) -> list:
+    out = []
+    for spec in filter(None, text.split(";")):
+        f = spec.split("~")
+        if len(f) >= 9:
+            o = dict(zip(ORDER_FIELDS, f[:9]))
+            o["qty"] = int(o["qty"])
+            out.append(o)
+    return out
+
+
+def scaled_orders(orders: list, fs: "FollowerState") -> list:
+    return [dict(o, qty=scale_qty(o["qty"], fs)) for o in orders]
 
 
 def scale_qty(qty: int, fs: FollowerState) -> int:
@@ -311,6 +329,8 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
             ms["account"] = parts[2]
         if len(parts) > 3:
             ms["accounts"] = sorted(a for a in parts[3].split(",") if a)
+        if len(parts) > 4:
+            ms["orders"] = parse_orders(parts[4])
         return master_reply(master["id"], ms)
 
     log_event("master", master["id"], body)
@@ -407,6 +427,7 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
                 "account": ms["account"],
                 "accounts": ms["accounts"],
                 "pending_commands": [c for _, c in ms["commands"]],
+                "orders": ms["orders"],
             }
             for mid, ms in MASTER_STATE.items()
         },
@@ -618,6 +639,7 @@ async def my_follower_status(x_follower_key: Optional[str] = Header(default=None
             "seconds_since_hb": round(time.time() - ms["last_hb"], 1) if ms["last_hb"] else None,
             "positions": {i: expected_position(p, fs) for i, p in ms["positions"].items() if p},
         },
+        "mismatch": fs.strikes >= RECON_STRIKES,
     }
 
 
@@ -674,3 +696,36 @@ async def my_follower_start(x_follower_key: Optional[str] = Header(default=None)
     await alert(f"{fs.id} resumed copying from the follower page")
     await check_loss_limit(fs)
     return {"ok": True, "paused": fs.paused}
+
+
+# ---------- sync a follower to the master ----------
+
+async def sync_follower(fs: FollowerState, by: str) -> dict:
+    if fs.ws is None:
+        raise HTTPException(status_code=409, detail="That follower's NinjaTrader isn't connected.")
+    ms = MASTER_STATE[fs.cfg["master_id"]]
+    if not master_online(ms):
+        raise HTTPException(status_code=409, detail="The master is offline, so there's nothing reliable to sync to.")
+    if fs.paused and fs.pause_reason == "loss_limit":
+        raise HTTPException(status_code=409, detail="Copying is stopped for today by the daily loss limit.")
+    targets = {i: expected_position(p, fs) for i, p in ms["positions"].items() if p}
+    pos_text = ";".join(f"{i}={q}" for i, q in targets.items())
+    orders_text = ";".join("~".join(str(o[k]) for k in ORDER_FIELDS) for o in scaled_orders(ms["orders"], fs))
+    fs.paused = False
+    fs.pause_reason = None
+    fs.strikes = 0
+    await send(fs, "sync", f"{pos_text}|{orders_text}")
+    await alert(f"{fs.id} synced to master by {by}: target {targets or 'flat'}, {len(ms['orders'])} working order(s)")
+    return {"ok": True}
+
+
+@app.post("/admin/followers/{follower_id}/sync")
+async def admin_sync(follower_id: str, x_admin_key: Optional[str] = Header(default=None)):
+    require_admin(x_admin_key)
+    return await sync_follower(get_follower(follower_id), "admin")
+
+
+@app.post("/me/follower/sync")
+async def my_sync(x_follower_key: Optional[str] = Header(default=None)):
+    fs = follower_from_key(x_follower_key)
+    return await sync_follower(fs, fs.id)
