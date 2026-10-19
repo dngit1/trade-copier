@@ -333,6 +333,8 @@
       v.loss = numberField("Daily loss limit ($, 0 = off)", "loss-" + id, "50", "0");
       v.profit = numberField("Daily max profit ($, 0 = off)", "profit-" + id, "50", "0");
       [v.mult, v.max, v.loss, v.profit].forEach((fld) => fld.input.addEventListener("input", () => { v.dirty = true; v.save.disabled = false; }));
+      v.masterSel = el("select", { id: "msel-" + id });
+      v.masterSel.addEventListener("change", () => { v.dirty = true; v.save.disabled = false; });
       v.acctSelect = el("select", { id: "acct-f-" + id });
       v.acctBtn = el("button", { class: "btn", type: "button", text: "Switch account", onclick: () => switchFollowerAccount(id) });
       v.acctSelect.addEventListener("change", () => updateFollowerAcctBtn(id));
@@ -347,7 +349,10 @@
           el("label", { class: "field", for: "acct-f-" + id }, [document.createTextNode("Copy into account"), v.acctSelect]),
         ]),
         el("div", { class: "actions" }, [v.acctBtn]),
-        el("div", { class: "fields" }, [v.mult.node, v.max.node, v.loss.node, v.profit.node]),
+        el("div", { class: "fields" }, [
+          el("label", { class: "field", for: "msel-" + id }, [document.createTextNode("Copy from master"), v.masterSel]),
+          v.mult.node, v.max.node, v.loss.node, v.profit.node,
+        ]),
         el("p", { class: "hint", text: "Example: master trades 1, multiplier 3 → follower trades 3 (up to max contracts). The max contracts in the follower's own follower.txt still applies as a hard cap on their computer." }),
         el("div", { class: "actions" }, [v.save, v.toggle, v.sync, v.pauseFlat]),
       ]);
@@ -372,6 +377,10 @@
       fact("Follows", f.master),
     );
     v.data = f;
+    if (!v.dirty && document.activeElement !== v.masterSel) {
+      v.masterSel.replaceChildren(...masterIds.map((mid) => el("option", { value: mid, text: mid })));
+      v.masterSel.value = f.master;
+    }
     if (document.activeElement !== v.acctSelect) {
       const keep = v.acctSelect.value;
       v.acctSelect.replaceChildren(...(f.accounts || []).map((a) => el("option", { value: a, text: a + (a === f.account ? "  (current)" : "") })));
@@ -434,9 +443,10 @@
       max_contracts: parseInt(v.max.input.value, 10),
       daily_loss_limit: parseFloat(v.loss.input.value || "0"),
       daily_profit_target: parseFloat(v.profit.input.value || "0"),
+      master_id: v.masterSel.value,
     };
     if ([body.multiplier, body.max_contracts, body.daily_loss_limit, body.daily_profit_target].some((n) => Number.isNaN(n))) {
-      toast("Fill in all three numbers before saving.", true);
+      toast("Fill in all the numbers before saving.", true);
       return;
     }
     try {
@@ -483,9 +493,11 @@
   });
 
   // ---------- loop ----------
+  let masterIds = [];
   async function refresh() {
     try {
       const s = await api("/status");
+      masterIds = Object.keys(s.masters);
       Object.entries(s.masters).forEach(([id, m]) => renderMaster(id, m));
       Object.entries(s.followers).forEach(([id, f]) => renderFollower(id, f));
       if (!Object.keys(s.followers).length) $("followers").replaceChildren(el("p", { class: "hint", text: "No followers yet. Add them to config.json on Render." }));

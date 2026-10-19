@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Master Account</title>
+<title>Master Accounts</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -67,18 +67,26 @@
   .muted.good { color: var(--good); font-weight: 600; }
   .muted.bad { color: var(--bad); font-weight: 600; }
   .big.good { color: var(--good); } .big.bad { color: var(--bad); }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+  .tab { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--surface);
+    border-radius: 999px; padding: 7px 14px; cursor: pointer; font-weight: 600; font-size: 15px; color: var(--ink); }
+  .tab[aria-selected="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+  .tab .dot { width: 9px; height: 9px; }
+  .tab .dot.good { color: var(--good); } .tab .dot.bad { color: var(--bad); } .tab .dot.amber { color: var(--amber); }
+  body.compact .tabs { margin-bottom: 8px; } body.compact .tab { padding: 5px 10px; font-size: 14px; }
+  .btn.outline { background: transparent; color: var(--bad); border: 2px solid var(--bad); margin-top: 10px; }
   [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 
 <main class="wrap">
-  <h1>Master Account</h1>
-  <p class="sub">Choose which NinjaTrader account the followers copy.</p>
+  <h1>Master Accounts</h1>
+  <p class="sub">Choose which NinjaTrader accounts the followers copy.</p>
   <button id="popout" class="popout" type="button">Open in small window</button>
 
   <form id="login" class="card" hidden>
-    <label class="field">Master key (the <b>key=</b> line in master.txt)
+    <label class="field">Master key (any key from your master.txt)
       <input id="keyInput" type="password" autocomplete="current-password" required>
     </label>
     <button class="btn" type="submit">Open</button>
@@ -86,13 +94,14 @@
   </form>
 
   <div id="app" hidden>
+    <div id="tabs" class="tabs" role="tablist" hidden></div>
     <div class="card">
       <div id="status" class="status"><span class="dot"></span><span>Checking…</span></div>
       <p id="statusNote" class="muted"></p>
     </div>
 
     <div class="card">
-      <div class="label">Followers are copying</div>
+      <div class="label">Followers copy trades from</div>
       <div id="current" class="big">…</div>
       <p id="switching" class="muted amber" hidden></p>
     </div>
@@ -136,6 +145,39 @@
   const $ = (id) => document.getElementById(id);
   let key = null, timer = null, last = null, toastTimer = null;
   try { key = sessionStorage.getItem(STORE); } catch (e) {}
+
+  // ----- one tab per account -----
+  const TAB_STORE = STORE + ":tab";
+  let currentId = null;
+  try { currentId = sessionStorage.getItem(TAB_STORE); } catch (e) {}
+  function withId(path) { return path + (path.includes("?") ? "&" : "?") + "id=" + encodeURIComponent(currentId || ""); }
+  function renderTabs(slots, dotClass) {
+    const tabs = $("tabs");
+    tabs.hidden = slots.length < 2;
+    if (!slots.some((x) => x.id === currentId)) currentId = slots.length ? slots[0].id : null;
+    tabs.replaceChildren(...slots.map((x) => {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "tab"; b.setAttribute("role", "tab");
+      b.setAttribute("aria-selected", String(x.id === currentId));
+      const d = document.createElement("span"); d.className = "dot " + dotClass(x);
+      b.append(d, document.createTextNode(x.id));
+      b.addEventListener("click", () => {
+        if (x.id === currentId) return;
+        currentId = x.id;
+        try { sessionStorage.setItem(TAB_STORE, currentId); } catch (e) {}
+        resetDirty();
+        refresh();
+      });
+      return b;
+    }));
+    return slots.find((x) => x.id === currentId);
+  }
+
+  function resetDirty() {
+    profitDirty = false; $("profitBtn").disabled = true;
+    $("accountSelect").value = "";
+  }
+  function masterDot(x) { return !x.online ? "bad" : (x.paused || x.locked) ? "amber" : "good"; }
 
   function toast(msg, isError) {
     const t = $("toast");
@@ -206,11 +248,11 @@
     if (!last) return;
     try {
       if (last.paused) {
-        await api("/me/master/resume", "POST");
+        await api(withId("/me/master/resume"), "POST");
         toast("Copying resumed. Followers copy your next trade; anything you already have open isn't copied.");
       } else {
         if (!confirm("Pause copying?\n\nYour new trades won't be copied. Followers keep any positions they already hold.")) return;
-        await api("/me/master/pause", "POST");
+        await api(withId("/me/master/pause"), "POST");
         toast("Copying paused.");
       }
       refresh();
@@ -218,9 +260,9 @@
   });
 
   $("pauseFlatBtn").addEventListener("click", async () => {
-    if (!confirm("Close ALL positions and orders on your account and every follower, and pause copying?")) return;
+    if (!confirm("Close ALL positions and orders on " + (last ? last.account || last.id : "this account") + " and every follower copying it, and pause copying?")) return;
     try {
-      const r = await api("/me/master/pause?flatten=true", "POST");
+      const r = await api(withId("/me/master/pause?flatten=true"), "POST");
       toast(r.master_offline ? "Followers flattened. Your NinjaTrader is offline, so flatten your account by hand."
                              : "Flattening your account and all followers. Copying is paused.", !!r.master_offline);
       refresh();
@@ -234,7 +276,7 @@
     const v = parseFloat($("profitInput").value || "0");
     if (Number.isNaN(v) || v < 0) { toast("Enter a number of 0 or more.", true); return; }
     try {
-      await api("/me/master/settings", "POST", { daily_profit_target: v });
+      await api(withId("/me/master/settings"), "POST", { daily_profit_target: v });
       profitDirty = false; $("profitBtn").disabled = true;
       toast("Daily max profit saved.");
       refresh();
@@ -249,16 +291,20 @@
   }
 
   async function refresh() {
-    try { render(await api("/me/master")); }
+    try {
+      const data = await api("/me/master");
+      const slot = renderTabs(data.slots || [], masterDot);
+      if (slot) render(slot);
+    }
     catch (e) { if (e.message !== "unauthorized") $("statusNote").textContent = "Can't reach the server. Retrying…"; }
   }
 
   $("accountSelect").addEventListener("change", updateButton);
   $("switchBtn").addEventListener("click", async () => {
     const account = $("accountSelect").value;
-    if (!confirm("Followers will copy trades from " + account + " from now on. Continue?")) return;
+    if (!confirm("Followers of " + currentId + " will copy trades from " + account + " from now on. Continue?")) return;
     try {
-      await api("/me/master/account", "POST", { account });
+      await api(withId("/me/master/account"), "POST", { account });
       toast("Switching to " + account + ". This takes about 5 seconds.");
       refresh();
     } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
@@ -270,7 +316,7 @@
   if (isCompact) document.body.classList.add("compact");
   $("popout").addEventListener("click", () => {
     const w = window.open(location.pathname + "?compact=1", "copier-" + location.pathname.replace(/\W/g, ""),
-      "popup=yes,width=" + 380 + ",height=" + 520);
+      "popup=yes,width=" + 400 + ",height=" + 560);
     if (!w) toast("Your browser blocked the pop-up. Allow pop-ups for this site and try again.", true);
   });
   function fitWindow() {
