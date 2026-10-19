@@ -215,15 +215,16 @@ async def fan_out(master_id: str, parts: list) -> None:
 async def follow_master_flat(master_id: str, inst: str) -> None:
     if MASTER_STATE[master_id]["paused"]:
         return  # copying is paused from the master page: the master trades on its own
+    # Master orders still working in this instrument (e.g. a new entry limit) must not be cleared.
+    keep = ",".join(o["id"] for o in MASTER_STATE[master_id]["orders"] if o["instrument"] == inst)
     sent = []
     for fs in FOLLOWERS:
         if fs.cfg["master_id"] != master_id or fs.paused or fs.ws is None:
             continue
-        if fs.positions.get(inst):
-            await send(fs, "flatcheck", inst)
-            sent.append(fs.id)
-    if sent:
-        await alert(f"Master went flat in {inst}; checking followers {sent} are flat too")
+        await send(fs, "flatcheck", f"{inst}|{keep}")
+        sent.append(fs.id)
+    if sent:  # happens on every exit, so log it instead of sending an alert
+        log.info("Master went flat in %s; flat check sent to %s", inst, sent)
 
 
 async def check_master_profit(master_id: str, ms: dict) -> None:
@@ -395,16 +396,17 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
                 switched = True
                 await alert(f"Master {master['id']} now copying from account {parts[2]} (was {ms['account']})")
             ms["account"] = parts[2]
-        # The master went flat in an instrument (including a broker/prop-firm auto-liquidation,
-        # which never shows up as a copyable order): make sure followers are flat there too.
-        if not switched:
-            gone_flat = [i for i, q in before.items() if q and not ms["positions"].get(i)]
-            for inst in gone_flat:
-                await follow_master_flat(master["id"], inst)
         if len(parts) > 3:
             ms["accounts"] = sorted(a for a in parts[3].split(",") if a)
         if len(parts) > 4:
             ms["orders"] = parse_orders(parts[4])
+        # The master went flat in an instrument (including a broker/prop-firm auto-liquidation,
+        # which never shows up as a copyable order): make sure followers are flat there too,
+        # and clear their leftover copied stops/targets.
+        if not switched:
+            gone_flat = [i for i, q in before.items() if q and not ms["positions"].get(i)]
+            for inst in gone_flat:
+                await follow_master_flat(master["id"], inst)
         if len(parts) > 5 and parts[5]:
             try:
                 ms["pnl"] = float(parts[5])
