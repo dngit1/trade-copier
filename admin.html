@@ -227,6 +227,8 @@
       v.profit = el("input", { id: "mprofit-" + id, type: "number", step: "50", min: "0", inputmode: "decimal" });
       v.profit.addEventListener("input", () => { v.profitDirty = true; v.profitBtn.disabled = false; });
       v.profitBtn = el("button", { class: "btn primary", type: "button", text: "Save max profit", disabled: "", onclick: () => saveMasterProfit(id) });
+      v.pauseBtn = el("button", { class: "btn", type: "button", text: "Pause copying" });
+      v.pauseFlatBtn = el("button", { class: "btn danger", type: "button", text: "Pause and flatten", onclick: () => pauseMaster(id, true) });
       v.root = el("div", { class: "panel" }, [
         el("div", { class: "row-head" }, [el("h3", { text: id }), v.pill]),
         v.facts,
@@ -235,12 +237,15 @@
         v.hint,
         el("div", { class: "fields" }, [el("label", { class: "field", for: "mprofit-" + id }, [document.createTextNode("Master daily max profit ($, 0 = off)"), v.profit])]),
         el("div", { class: "actions" }, [v.profitBtn]),
+        el("div", { class: "actions" }, [v.pauseBtn, v.pauseFlatBtn]),
       ]);
       $("masters").appendChild(v.root);
     }
     v.pill.textContent = m.locked ? "Done for today (max profit)" : m.paused ? "Copying paused" : m.online ? "Online" : "Offline";
     v.pill.className = "pill " + (m.locked || m.paused ? "warn" : m.online ? "ok" : "bad");
     if (!v.profitDirty && document.activeElement !== v.profit) v.profit.value = m.daily_profit_target;
+    v.pauseBtn.textContent = m.paused ? "Resume copying" : "Pause copying";
+    v.pauseBtn.onclick = () => (m.paused ? resumeMaster(id) : pauseMaster(id, false));
 
     v.facts.replaceChildren(
       fact("Copying from", m.account || "Not reported yet"),
@@ -263,6 +268,27 @@
       : !m.online
       ? "The master computer isn't connected. Start NinjaTrader there to change accounts."
       : "Only accounts connected in NinjaTrader on the master computer are listed. Switch while flat: followers keep any positions they already hold.";
+  }
+
+  async function pauseMaster(id, flatten) {
+    const msg = flatten
+      ? "Close ALL positions and orders on the master (" + id + ") and every follower, and pause copying?"
+      : "Pause copying from " + id + "?\n\nNew master trades won't be copied. Followers keep any positions they already hold.";
+    if (!confirm(msg)) return;
+    try {
+      const r = await api("/admin/masters/" + encodeURIComponent(id) + "/pause" + (flatten ? "?flatten=true" : ""), "POST");
+      toast(r.master_offline ? "Followers flattened. The master is offline, so flatten it by hand."
+            : flatten ? "Flattening the master and all followers. Copying is paused." : "Copying paused.", !!r.master_offline);
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  }
+
+  async function resumeMaster(id) {
+    try {
+      await api("/admin/masters/" + encodeURIComponent(id) + "/resume", "POST");
+      toast("Copying resumed. Followers copy the next master trade; anything already open isn't copied.");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
   }
 
   async function saveMasterProfit(id) {

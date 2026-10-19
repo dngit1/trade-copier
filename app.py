@@ -749,6 +749,24 @@ async def my_master_pause(flatten: bool = False, x_master_key: Optional[str] = H
     return await pause_master(master["id"], flatten, "master page")
 
 
+@app.post("/admin/masters/{master_id}/pause")
+async def admin_master_pause(master_id: str, flatten: bool = False, x_admin_key: Optional[str] = Header(default=None)):
+    require_admin(x_admin_key)
+    if master_id not in MASTER_STATE:
+        raise HTTPException(status_code=404, detail=f"no master {master_id}")
+    return await pause_master(master_id, flatten, "admin")
+
+
+@app.post("/admin/masters/{master_id}/resume")
+async def admin_master_resume(master_id: str, x_admin_key: Optional[str] = Header(default=None)):
+    require_admin(x_admin_key)
+    if master_id not in MASTER_STATE:
+        raise HTTPException(status_code=404, detail=f"no master {master_id}")
+    save_master_paused(master_id, False)
+    await alert(f"Master {master_id}: copying resumed by admin")
+    return {"ok": True}
+
+
 @app.post("/me/master/resume")
 async def my_master_resume(x_master_key: Optional[str] = Header(default=None)):
     master = master_from_key(x_master_key)
