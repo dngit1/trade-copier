@@ -66,6 +66,7 @@
   .popout { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 14px; margin: 0 0 16px; }
   .muted.good { color: var(--good); font-weight: 600; }
   .muted.bad { color: var(--bad); font-weight: 600; }
+  .big.good { color: var(--good); } .big.bad { color: var(--bad); }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -95,6 +96,25 @@
       <div id="current" class="big">…</div>
       <p id="switching" class="muted amber" hidden></p>
     </div>
+
+    <div class="card">
+      <div class="label">Copying</div>
+      <div id="copyState" class="big">…</div>
+      <p id="copyNote" class="muted"></p>
+      <button id="pauseBtn" class="btn" type="button">Pause copying</button>
+      <button id="pauseFlatBtn" class="btn outline" type="button">Pause and flatten</button>
+    </div>
+
+    <form id="profitForm" class="card">
+      <div class="label">Today's P&amp;L</div>
+      <div id="pnl" class="big">–</div>
+      <p id="lockNote" class="muted bad" hidden>Daily max profit reached. The master and all followers were flattened, and copying is stopped until the next session (6 pm ET).</p>
+      <label class="field" for="profitInput" style="margin-top:12px">Daily max profit ($)
+        <input id="profitInput" type="number" step="50" min="0" inputmode="decimal" required>
+      </label>
+      <button id="profitBtn" class="btn" type="submit" disabled>Save</button>
+      <p class="muted">When today's P&amp;L reaches this, your account and every follower are flattened and copying stops until 6 pm ET. 0 = no limit.</p>
+    </form>
 
     <div class="card">
       <label class="field" for="accountSelect">Change to
@@ -165,7 +185,63 @@
       sel.value = (s.accounts || []).includes(keep) ? keep : (s.account || "");
     }
     updateButton();
+
+    const pnl = $("pnl");
+    pnl.textContent = money(s.pnl);
+    pnl.className = "big" + (s.pnl < 0 ? " bad" : s.pnl > 0 ? " good" : "");
+    $("lockNote").hidden = !s.locked;
+
+    const cs = $("copyState");
+    if (s.locked) { cs.textContent = "Done for today"; cs.className = "big bad"; }
+    else if (s.paused) { cs.textContent = "Paused"; cs.className = "big bad"; }
+    else { cs.textContent = "On"; cs.className = "big good"; }
+    $("copyNote").textContent = s.paused
+      ? "Your trades are not being copied. Followers keep any positions they already hold."
+      : "Your trades are copied to followers.";
+    $("pauseBtn").textContent = s.paused ? "Resume copying" : "Pause copying";
+    if (!profitDirty && document.activeElement !== $("profitInput")) $("profitInput").value = s.daily_profit_target;
   }
+
+  $("pauseBtn").addEventListener("click", async () => {
+    if (!last) return;
+    try {
+      if (last.paused) {
+        await api("/me/master/resume", "POST");
+        toast("Copying resumed. Followers copy your next trade; anything you already have open isn't copied.");
+      } else {
+        if (!confirm("Pause copying?\n\nYour new trades won't be copied. Followers keep any positions they already hold.")) return;
+        await api("/me/master/pause", "POST");
+        toast("Copying paused.");
+      }
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  });
+
+  $("pauseFlatBtn").addEventListener("click", async () => {
+    if (!confirm("Close ALL positions and orders on your account and every follower, and pause copying?")) return;
+    try {
+      const r = await api("/me/master/pause?flatten=true", "POST");
+      toast(r.master_offline ? "Followers flattened. Your NinjaTrader is offline, so flatten your account by hand."
+                             : "Flattening your account and all followers. Copying is paused.", !!r.master_offline);
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  });
+
+  let profitDirty = false;
+  $("profitInput").addEventListener("input", () => { profitDirty = true; $("profitBtn").disabled = false; });
+  $("profitForm").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const v = parseFloat($("profitInput").value || "0");
+    if (Number.isNaN(v) || v < 0) { toast("Enter a number of 0 or more.", true); return; }
+    try {
+      await api("/me/master/settings", "POST", { daily_profit_target: v });
+      profitDirty = false; $("profitBtn").disabled = true;
+      toast("Daily max profit saved.");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  });
+
+  function money(n) { return n == null ? "–" : (n < 0 ? "−$" : "$") + Math.abs(n).toFixed(2); }
 
   function updateButton() {
     const s = last;

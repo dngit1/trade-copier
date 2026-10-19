@@ -140,6 +140,10 @@
         <input id="loss" type="number" step="50" min="0" inputmode="decimal" required>
       </label>
       <p class="muted">If today's loss reaches this, your positions are closed and copying stops. 0 = no limit.</p>
+      <label class="field">Daily max profit ($)
+        <input id="profit" type="number" step="50" min="0" inputmode="decimal" required>
+      </label>
+      <p class="muted">If today's profit reaches this, your positions are closed and copying stops for the day. 0 = no limit.</p>
       <button id="saveBtn" class="btn" type="submit" disabled>Save settings</button>
     </form>
 
@@ -199,6 +203,15 @@
     } else if (s.paused && s.pause_reason === "loss_limit") {
       cls = "amber"; text = "Stopped for today";
       note = "Your daily loss limit was reached, so your positions were closed. Copying starts again automatically at the next session (6 pm ET).";
+    } else if (s.paused && s.pause_reason === "profit_target") {
+      cls = "good"; text = "Done for today";
+      note = "Your daily max profit was reached, so your positions were closed. Copying starts again automatically at the next session (6 pm ET).";
+    } else if (s.master && s.master.paused) {
+      cls = "amber"; text = "Master paused";
+      note = "The master has paused copying. New trades will be copied again when the master resumes.";
+    } else if (s.master && s.master.locked) {
+      cls = "amber"; text = "Master done for today";
+      note = "The master reached its daily max profit, so positions were closed. Copying starts again at the next session (6 pm ET).";
     } else if (s.paused) {
       cls = "amber"; text = "Stopped";
       note = "New trades from the master are not being copied.";
@@ -224,14 +237,15 @@
     pnl.className = s.pnl < 0 ? "t-bad" : s.pnl > 0 ? "t-good" : "";
     $("myPos").textContent = posText(s.positions);
     $("mismatchNote").hidden = !s.mismatch;
-    $("syncBtn").disabled = !m.online || !s.ninjatrader_connected || (s.paused && s.pause_reason === "loss_limit");
+    $("syncBtn").disabled = !m.online || !s.ninjatrader_connected || (s.paused && ["loss_limit", "profit_target"].includes(s.pause_reason)) || s.master.locked || s.master.paused;
 
     renderAccount(s);
 
-    if (!dirty && !["mult", "maxc", "loss"].includes(document.activeElement && document.activeElement.id)) {
+    if (!dirty && !["mult", "maxc", "loss", "profit"].includes(document.activeElement && document.activeElement.id)) {
       $("mult").value = s.multiplier;
       $("maxc").value = s.max_contracts;
       $("loss").value = s.daily_loss_limit;
+      $("profit").value = s.daily_profit_target;
     }
   }
 
@@ -293,7 +307,7 @@
     catch (e) { if (e.message !== "unauthorized") $("stateNote").textContent = "Can't reach the server. Retrying…"; }
   }
 
-  ["mult", "maxc", "loss"].forEach((id) => $(id).addEventListener("input", () => { dirty = true; $("saveBtn").disabled = false; }));
+  ["mult", "maxc", "loss", "profit"].forEach((id) => $(id).addEventListener("input", () => { dirty = true; $("saveBtn").disabled = false; }));
 
   $("settings").addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -301,10 +315,11 @@
       multiplier: Number($("mult").value),
       max_contracts: Number($("maxc").value),
       daily_loss_limit: parseFloat($("loss").value || "0"),
+      daily_profit_target: parseFloat($("profit").value || "0"),
     };
     if (!Number.isInteger(body.multiplier) || body.multiplier < 1) { toast("The multiplier must be a whole number: 1, 2, 3…", true); return; }
     if (!Number.isInteger(body.max_contracts) || body.max_contracts < 1) { toast("Max contracts must be a whole number of at least 1.", true); return; }
-    if (Number.isNaN(body.daily_loss_limit)) { toast("Please enter numbers only.", true); return; }
+    if (Number.isNaN(body.daily_loss_limit) || Number.isNaN(body.daily_profit_target)) { toast("Please enter numbers only.", true); return; }
     try {
       await api("/me/follower/settings", "POST", body);
       dirty = false; $("saveBtn").disabled = true;

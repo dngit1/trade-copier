@@ -84,7 +84,8 @@ def save_setting(k: str, v: dict) -> None:
     DB.commit()
 
 
-EDITABLE = ("multiplier", "max_contracts", "daily_loss_limit")
+EDITABLE = ("multiplier", "max_contracts", "daily_loss_limit", "daily_profit_target")
+DAILY_STOP_REASONS = ("loss_limit", "profit_target")   # pauses that end automatically at the next session
 
 
 class FollowerState:
@@ -96,8 +97,8 @@ class FollowerState:
         self.id = cfg["id"]
         self.ws: Optional[WebSocket] = None
         self.paused = False
-        self.pause_reason: Optional[str] = None   # "loss_limit" or "manual"
-        self.loss_day: Optional[str] = None       # trading day the loss limit was hit
+        self.pause_reason: Optional[str] = None   # "loss_limit", "profit_target" or "manual"
+        self.loss_day: Optional[str] = None       # trading day a daily limit was hit
         self.last_hb = 0.0
         self.pnl = 0.0
         self.positions: dict = {}
@@ -112,9 +113,17 @@ class FollowerState:
 MASTERS = {m["key"]: m for m in CFG["masters"]}
 MASTER_STATE = {
     m["id"]: {"last_hb": 0.0, "positions": {}, "offline_alerted": False,
-              "account": None, "accounts": [], "commands": [], "orders": []}
+              "account": None, "accounts": [], "commands": [], "orders": [],
+              "pnl": None, "locked_day": None, "armed": True, "last_flatten_at": 0.0,
+              "paused": bool((load_setting(f"master:{m['id']}") or {}).get("paused", False)),
+              "daily_profit_target": float((load_setting(f"master:{m['id']}") or {}).get(
+                  "daily_profit_target", m.get("daily_profit_target", 0)) or 0)}
     for m in CFG["masters"]
 }
+
+
+def master_locked(ms: dict) -> bool:
+    return ms["locked_day"] == trading_day()
 FOLLOWERS = [FollowerState(fc) for fc in CFG["followers"]]
 FOLLOWER_BY_KEY = {fs.cfg["key"]: fs for fs in FOLLOWERS}
 FOLLOWER_BY_ID = {fs.id: fs for fs in FOLLOWERS}
@@ -187,6 +196,9 @@ async def send(fs: FollowerState, kind: str, rest: str) -> None:
 
 async def fan_out(master_id: str, parts: list) -> None:
     kind = parts[1]
+    ms = MASTER_STATE[master_id]
+    if kind != "cancel" and (master_locked(ms) or ms["paused"]):
+        return  # master paused, or hit its daily max profit: nothing new is copied
     for fs in FOLLOWERS:
         if fs.cfg["master_id"] != master_id:
             continue
@@ -198,6 +210,59 @@ async def fan_out(master_id: str, parts: list) -> None:
         oid, inst, action, otype, qty, limit, stop, oco, tif = parts[2:11]
         q = scale_qty(int(qty), fs)
         await send(fs, kind, f"{oid}|{inst}|{action}|{otype}|{q}|{limit}|{stop}|{oco}|{tif}")
+
+
+async def follow_master_flat(master_id: str, inst: str) -> None:
+    if MASTER_STATE[master_id]["paused"]:
+        return  # copying is paused from the master page: the master trades on its own
+    sent = []
+    for fs in FOLLOWERS:
+        if fs.cfg["master_id"] != master_id or fs.paused or fs.ws is None:
+            continue
+        if fs.positions.get(inst):
+            await send(fs, "flatcheck", inst)
+            sent.append(fs.id)
+    if sent:
+        await alert(f"Master went flat in {inst}; checking followers {sent} are flat too")
+
+
+async def check_master_profit(master_id: str, ms: dict) -> None:
+    target = float(ms["daily_profit_target"] or 0)
+    pnl = ms["pnl"]
+    if pnl is None:
+        return
+    if target <= 0 or pnl < target:
+        ms["armed"] = True  # P&L is below the target (e.g. after the daily reset), so it can trigger again
+    if target > 0 and pnl >= target and ms["armed"] and not master_locked(ms):
+        ms["locked_day"] = trading_day()
+        ms["armed"] = False
+        await alert(f"Master {master_id} hit its daily max profit (P&L {pnl:.2f}); flattening the master and all "
+                    f"followers, copying stopped until the next session (6 pm ET)")
+        for fs in FOLLOWERS:
+            if fs.cfg["master_id"] == master_id and fs.ws is not None and not fs.paused:
+                await send(fs, "flatten", "ALL")
+    # While locked, keep the master flat (re-check at most every 10 seconds).
+    if master_locked(ms) and ms["positions"] and time.time() - ms["last_flatten_at"] > 10:
+        ms["last_flatten_at"] = time.time()
+        if not any(c == "flatten|ALL" for _, c in ms["commands"]):
+            queue_master_command(master_id, "flatten|ALL")
+
+
+async def set_master_profit_target(master_id: str, body: dict, by: str) -> dict:
+    try:
+        target = float(body["daily_profit_target"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Please enter a number.")
+    if target < 0:
+        raise HTTPException(status_code=400, detail="The daily max profit can't be negative (use 0 for no limit).")
+    ms = MASTER_STATE[master_id]
+    ms["daily_profit_target"] = target
+    saved = load_setting(f"master:{master_id}") or {}
+    saved["daily_profit_target"] = target
+    save_setting(f"master:{master_id}", saved)
+    await alert(f"Master {master_id} daily max profit set to {target:.0f} by {by}")
+    await check_master_profit(master_id, ms)
+    return {"ok": True}
 
 
 def queue_master_command(master_id: str, command: str) -> None:
@@ -218,17 +283,17 @@ def master_reply(master_id: str, ms: dict) -> PlainTextResponse:
 async def maybe_auto_resume(fs: "FollowerState", now: float) -> None:
     """A follower paused by the daily loss limit starts copying again in the next trading session,
     once its NinjaTrader reports a fresh P&L that is back above the limit."""
-    if not (fs.paused and fs.pause_reason == "loss_limit") or trading_day() == fs.loss_day:
+    if not (fs.paused and fs.pause_reason in DAILY_STOP_REASONS) or trading_day() == fs.loss_day:
         return
     if fs.ws is None or now - fs.last_hb > FOLLOWER_TIMEOUT_SEC:
         return  # wait for a fresh heartbeat so the P&L is today's
-    limit = float(fs.cfg.get("daily_loss_limit") or 0)
-    if limit > 0 and fs.pnl <= -limit:
+    if daily_limit_hit(fs):
         return  # NinjaTrader hasn't reset the day's P&L yet; check again in 5 seconds
+    reason = "loss limit" if fs.pause_reason == "loss_limit" else "max profit"
     fs.paused = False
     fs.pause_reason = None
     fs.strikes = 0
-    await alert(f"{fs.id}: new trading session, copying resumed automatically after yesterday's loss limit")
+    await alert(f"{fs.id}: new trading session, copying resumed automatically after yesterday's daily {reason}")
 
 
 async def monitor() -> None:
@@ -322,15 +387,30 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
         await alert(f"Master {master['id']} is back online")
 
     if parts[0] == "hb":
+        before = ms["positions"]
         ms["positions"] = parse_positions(parts[1] if len(parts) > 1 else "")
+        switched = False
         if len(parts) > 2 and parts[2]:
             if ms["account"] and ms["account"] != parts[2]:
+                switched = True
                 await alert(f"Master {master['id']} now copying from account {parts[2]} (was {ms['account']})")
             ms["account"] = parts[2]
+        # The master went flat in an instrument (including a broker/prop-firm auto-liquidation,
+        # which never shows up as a copyable order): make sure followers are flat there too.
+        if not switched:
+            gone_flat = [i for i, q in before.items() if q and not ms["positions"].get(i)]
+            for inst in gone_flat:
+                await follow_master_flat(master["id"], inst)
         if len(parts) > 3:
             ms["accounts"] = sorted(a for a in parts[3].split(",") if a)
         if len(parts) > 4:
             ms["orders"] = parse_orders(parts[4])
+        if len(parts) > 5 and parts[5]:
+            try:
+                ms["pnl"] = float(parts[5])
+            except ValueError:
+                pass
+        await check_master_profit(master["id"], ms)
         return master_reply(master["id"], ms)
 
     log_event("master", master["id"], body)
@@ -390,14 +470,26 @@ async def follower_socket(ws: WebSocket):
             await alert(f"Follower {fs.id} disconnected")
 
 
+def daily_limit_hit(fs: FollowerState) -> Optional[str]:
+    loss = float(fs.cfg.get("daily_loss_limit") or 0)
+    profit = float(fs.cfg.get("daily_profit_target") or 0)
+    if loss > 0 and fs.pnl <= -loss:
+        return "loss_limit"
+    if profit > 0 and fs.pnl >= profit:
+        return "profit_target"
+    return None
+
+
 async def check_loss_limit(fs: FollowerState) -> None:
-    limit = float(fs.cfg.get("daily_loss_limit") or 0)
-    if limit > 0 and fs.pnl <= -limit and not fs.paused:
+    """Checks both the daily loss limit and the daily max profit."""
+    hit = daily_limit_hit(fs)
+    if hit and not fs.paused:
         fs.paused = True
-        fs.pause_reason = "loss_limit"
+        fs.pause_reason = hit
         fs.loss_day = trading_day()
         await send(fs, "flatten", "ALL")
-        await alert(f"{fs.id} hit daily loss limit (P&L {fs.pnl:.2f}); flattened and paused until the next session (6 pm ET)")
+        what = "daily loss limit" if hit == "loss_limit" else "daily max profit"
+        await alert(f"{fs.id} hit {what} (P&L {fs.pnl:.2f}); flattened and paused until the next session (6 pm ET)")
 
 
 # ---------------- admin ----------------
@@ -428,6 +520,10 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
                 "accounts": ms["accounts"],
                 "pending_commands": [c for _, c in ms["commands"]],
                 "orders": ms["orders"],
+                "pnl": ms["pnl"],
+                "daily_profit_target": ms["daily_profit_target"],
+                "locked": master_locked(ms),
+                "paused": ms["paused"],
             }
             for mid, ms in MASTER_STATE.items()
         },
@@ -446,6 +542,7 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
                 "multiplier": float(fs.cfg.get("multiplier", 1.0)),
                 "max_contracts": int(fs.cfg.get("max_contracts", 1)),
                 "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
+                "daily_profit_target": float(fs.cfg.get("daily_profit_target") or 0),
             }
             for fs in FOLLOWERS
         },
@@ -468,6 +565,10 @@ def validate_settings(body: dict, fields: tuple) -> dict:
             out["daily_loss_limit"] = float(body["daily_loss_limit"])
             if out["daily_loss_limit"] < 0:
                 raise HTTPException(status_code=400, detail="The daily loss limit can't be negative (use 0 for no limit).")
+        if "daily_profit_target" in fields and "daily_profit_target" in body:
+            out["daily_profit_target"] = float(body["daily_profit_target"] or 0)
+            if out["daily_profit_target"] < 0:
+                raise HTTPException(status_code=400, detail="The daily max profit can't be negative (use 0 for no limit).")
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Please enter numbers only.")
     return out
@@ -595,8 +696,63 @@ async def my_master_status(x_master_key: Optional[str] = Header(default=None)):
         "account": ms["account"],
         "accounts": ms["accounts"],
         "switching_to": switching,
+        "pnl": ms["pnl"],
+        "daily_profit_target": ms["daily_profit_target"],
+        "locked": master_locked(ms),
+        "paused": ms["paused"],
         "followers_connected": any(fs.cfg["master_id"] == master["id"] and fs.ws is not None for fs in FOLLOWERS),
     }
+
+
+@app.post("/me/master/settings")
+async def my_master_settings(body: dict = Body(...), x_master_key: Optional[str] = Header(default=None)):
+    master = master_from_key(x_master_key)
+    return await set_master_profit_target(master["id"], body, "master page")
+
+
+@app.post("/admin/masters/{master_id}/settings")
+async def admin_master_settings(master_id: str, body: dict = Body(...),
+                                x_admin_key: Optional[str] = Header(default=None)):
+    require_admin(x_admin_key)
+    if master_id not in MASTER_STATE:
+        raise HTTPException(status_code=404, detail=f"no master {master_id}")
+    return await set_master_profit_target(master_id, body, "admin")
+
+
+def save_master_paused(master_id: str, paused: bool) -> None:
+    MASTER_STATE[master_id]["paused"] = paused
+    saved = load_setting(f"master:{master_id}") or {}
+    saved["paused"] = paused
+    save_setting(f"master:{master_id}", saved)
+
+
+async def pause_master(master_id: str, flatten: bool, by: str) -> dict:
+    ms = MASTER_STATE[master_id]
+    save_master_paused(master_id, True)
+    if flatten:
+        queue_master_command(master_id, "flatten|ALL")
+        for fs in FOLLOWERS:
+            if fs.cfg["master_id"] == master_id and fs.ws is not None:
+                await send(fs, "flatten", "ALL")
+    note = "; master and followers flattened" if flatten else "; open positions left as they are"
+    offline = flatten and not master_online(ms)
+    await alert(f"Master {master_id}: copying paused by {by}{note}"
+                + (" (master is offline, flatten it by hand)" if offline else ""))
+    return {"ok": True, "master_offline": offline}
+
+
+@app.post("/me/master/pause")
+async def my_master_pause(flatten: bool = False, x_master_key: Optional[str] = Header(default=None)):
+    master = master_from_key(x_master_key)
+    return await pause_master(master["id"], flatten, "master page")
+
+
+@app.post("/me/master/resume")
+async def my_master_resume(x_master_key: Optional[str] = Header(default=None)):
+    master = master_from_key(x_master_key)
+    save_master_paused(master["id"], False)
+    await alert(f"Master {master['id']}: copying resumed from the master page")
+    return {"ok": True}
 
 
 @app.post("/me/master/account")
@@ -633,10 +789,13 @@ async def my_follower_status(x_follower_key: Optional[str] = Header(default=None
         "multiplier": float(fs.cfg.get("multiplier", 1.0)),
         "max_contracts": int(fs.cfg.get("max_contracts", 1)),
         "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
+        "daily_profit_target": float(fs.cfg.get("daily_profit_target") or 0),
         "master": {
             "name": fs.cfg["master_id"],
             "online": master_online(ms),
             "seconds_since_hb": round(time.time() - ms["last_hb"], 1) if ms["last_hb"] else None,
+            "locked": master_locked(ms),
+            "paused": ms["paused"],
             "positions": {i: expected_position(p, fs) for i, p in ms["positions"].items() if p},
         },
         "mismatch": fs.strikes >= RECON_STRIKES,
@@ -646,7 +805,7 @@ async def my_follower_status(x_follower_key: Optional[str] = Header(default=None
 @app.post("/me/follower/settings")
 async def my_follower_settings(body: dict = Body(...), x_follower_key: Optional[str] = Header(default=None)):
     fs = follower_from_key(x_follower_key)
-    await apply_settings(fs, validate_settings(body, ("multiplier", "max_contracts", "daily_loss_limit")), fs.id)
+    await apply_settings(fs, validate_settings(body, ("multiplier", "max_contracts", "daily_loss_limit", "daily_profit_target")), fs.id)
     return {"ok": True}
 
 
@@ -706,8 +865,12 @@ async def sync_follower(fs: FollowerState, by: str) -> dict:
     ms = MASTER_STATE[fs.cfg["master_id"]]
     if not master_online(ms):
         raise HTTPException(status_code=409, detail="The master is offline, so there's nothing reliable to sync to.")
-    if fs.paused and fs.pause_reason == "loss_limit":
-        raise HTTPException(status_code=409, detail="Copying is stopped for today by the daily loss limit.")
+    if fs.paused and fs.pause_reason in DAILY_STOP_REASONS:
+        raise HTTPException(status_code=409, detail="Copying is stopped for today by a daily limit.")
+    if master_locked(ms):
+        raise HTTPException(status_code=409, detail="The master reached its daily max profit, so copying is stopped until the next session.")
+    if ms["paused"]:
+        raise HTTPException(status_code=409, detail="Copying is paused on the master.")
     targets = {i: expected_position(p, fs) for i, p in ms["positions"].items() if p}
     pos_text = ";".join(f"{i}={q}" for i, q in targets.items())
     orders_text = ";".join("~".join(str(o[k]) for k in ORDER_FIELDS) for o in scaled_orders(ms["orders"], fs))

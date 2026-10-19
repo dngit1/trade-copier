@@ -224,20 +224,27 @@
       v.select = el("select", { id: "acct-" + id });
       v.button = el("button", { class: "btn primary", type: "button", text: "Switch account", onclick: () => switchAccount(id) });
       v.hint = el("p", { class: "hint" });
+      v.profit = el("input", { id: "mprofit-" + id, type: "number", step: "50", min: "0", inputmode: "decimal" });
+      v.profit.addEventListener("input", () => { v.profitDirty = true; v.profitBtn.disabled = false; });
+      v.profitBtn = el("button", { class: "btn primary", type: "button", text: "Save max profit", disabled: "", onclick: () => saveMasterProfit(id) });
       v.root = el("div", { class: "panel" }, [
         el("div", { class: "row-head" }, [el("h3", { text: id }), v.pill]),
         v.facts,
         el("div", { class: "fields" }, [el("label", { class: "field", for: "acct-" + id }, [document.createTextNode("Copy trades from account"), v.select])]),
         el("div", { class: "actions" }, [v.button]),
         v.hint,
+        el("div", { class: "fields" }, [el("label", { class: "field", for: "mprofit-" + id }, [document.createTextNode("Master daily max profit ($, 0 = off)"), v.profit])]),
+        el("div", { class: "actions" }, [v.profitBtn]),
       ]);
       $("masters").appendChild(v.root);
     }
-    v.pill.textContent = m.online ? "Online" : "Offline";
-    v.pill.className = "pill " + (m.online ? "ok" : "bad");
+    v.pill.textContent = m.locked ? "Done for today (max profit)" : m.paused ? "Copying paused" : m.online ? "Online" : "Offline";
+    v.pill.className = "pill " + (m.locked || m.paused ? "warn" : m.online ? "ok" : "bad");
+    if (!v.profitDirty && document.activeElement !== v.profit) v.profit.value = m.daily_profit_target;
 
     v.facts.replaceChildren(
       fact("Copying from", m.account || "Not reported yet"),
+      fact("Today's P&L", m.pnl == null ? "–" : (m.pnl < 0 ? "−$" : "$") + Math.abs(m.pnl).toFixed(2)),
       fact("Position", positionsText(m.positions)),
       fact("Last heartbeat", m.seconds_since_hb == null ? "Never" : m.seconds_since_hb + "s ago"),
       fact("Working orders", (m.orders || []).length ? m.orders.map(orderText).join("\n") : "None"),
@@ -256,6 +263,18 @@
       : !m.online
       ? "The master computer isn't connected. Start NinjaTrader there to change accounts."
       : "Only accounts connected in NinjaTrader on the master computer are listed. Switch while flat: followers keep any positions they already hold.";
+  }
+
+  async function saveMasterProfit(id) {
+    const v = masterViews[id];
+    const n = parseFloat(v.profit.value || "0");
+    if (Number.isNaN(n) || n < 0) { toast("Enter a number of 0 or more.", true); return; }
+    try {
+      await api("/admin/masters/" + encodeURIComponent(id) + "/settings", "POST", { daily_profit_target: n });
+      v.profitDirty = false; v.profitBtn.disabled = true;
+      toast("Master daily max profit saved.");
+      refresh();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
   }
 
   async function switchAccount(id) {
@@ -286,7 +305,8 @@
       v.mult = numberField("Size multiplier", "mult-" + id, "1", "1");
       v.max = numberField("Max contracts", "max-" + id, "1", "1");
       v.loss = numberField("Daily loss limit ($, 0 = off)", "loss-" + id, "50", "0");
-      [v.mult, v.max, v.loss].forEach((fld) => fld.input.addEventListener("input", () => { v.dirty = true; v.save.disabled = false; }));
+      v.profit = numberField("Daily max profit ($, 0 = off)", "profit-" + id, "50", "0");
+      [v.mult, v.max, v.loss, v.profit].forEach((fld) => fld.input.addEventListener("input", () => { v.dirty = true; v.save.disabled = false; }));
       v.acctSelect = el("select", { id: "acct-f-" + id });
       v.acctBtn = el("button", { class: "btn", type: "button", text: "Switch account", onclick: () => switchFollowerAccount(id) });
       v.acctSelect.addEventListener("change", () => updateFollowerAcctBtn(id));
@@ -301,7 +321,7 @@
           el("label", { class: "field", for: "acct-f-" + id }, [document.createTextNode("Copy into account"), v.acctSelect]),
         ]),
         el("div", { class: "actions" }, [v.acctBtn]),
-        el("div", { class: "fields" }, [v.mult.node, v.max.node, v.loss.node]),
+        el("div", { class: "fields" }, [v.mult.node, v.max.node, v.loss.node, v.profit.node]),
         el("p", { class: "hint", text: "Example: master trades 1, multiplier 3 → follower trades 3 (up to max contracts). The max contracts in the follower's own follower.txt still applies as a hard cap on their computer." }),
         el("div", { class: "actions" }, [v.save, v.toggle, v.sync, v.pauseFlat]),
       ]);
@@ -311,6 +331,7 @@
     let state, cls;
     if (!f.connected) { state = "Offline"; cls = "bad"; }
     else if (f.paused && f.pause_reason === "loss_limit") { state = "Paused: loss limit (resumes 6 pm ET)"; cls = "warn"; }
+    else if (f.paused && f.pause_reason === "profit_target") { state = "Done: max profit (resumes 6 pm ET)"; cls = "ok"; }
     else if (f.paused) { state = "Paused"; cls = "warn"; }
     else if (f.mismatch) { state = "Position mismatch"; cls = "bad"; }
     else { state = "Copying"; cls = "ok"; }
@@ -341,6 +362,7 @@
       v.mult.input.value = f.multiplier;
       v.max.input.value = f.max_contracts;
       v.loss.input.value = f.daily_loss_limit;
+      v.profit.input.value = f.daily_profit_target;
     }
     v.toggle.textContent = f.paused ? "Resume copying" : "Pause copying";
     v.toggle.onclick = () => (f.paused ? resume(id) : pause(id, false));
@@ -385,8 +407,9 @@
       multiplier: parseFloat(v.mult.input.value),
       max_contracts: parseInt(v.max.input.value, 10),
       daily_loss_limit: parseFloat(v.loss.input.value || "0"),
+      daily_profit_target: parseFloat(v.profit.input.value || "0"),
     };
-    if ([body.multiplier, body.max_contracts, body.daily_loss_limit].some((n) => Number.isNaN(n))) {
+    if ([body.multiplier, body.max_contracts, body.daily_loss_limit, body.daily_profit_target].some((n) => Number.isNaN(n))) {
       toast("Fill in all three numbers before saving.", true);
       return;
     }
