@@ -78,6 +78,22 @@
   .btn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); }
   .btn.danger { color: var(--short); border-color: var(--short); }
 
+
+  /* Daily P&L table */
+  .pnl-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  .pnl-controls label.field { min-width: 140px; }
+  .pnl-scroll { overflow-x: auto; margin-top: 14px; border: 1px solid var(--line); border-radius: 4px; }
+  table.pnl { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 15px; }
+  table.pnl th, table.pnl td { padding: 7px 12px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  table.pnl thead th { font-weight: 600; color: var(--muted); font-size: 13px; background: var(--surface); position: sticky; top: 0; }
+  table.pnl th[scope="row"], table.pnl thead th:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); z-index: 1; }
+  table.pnl th[scope="row"] small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+  table.pnl tr.group-row th { background: var(--bg); text-align: left; font-size: 13px; color: var(--muted); font-weight: 700; }
+  table.pnl tr.subtotal th, table.pnl tr.subtotal td { font-weight: 700; border-bottom: 2px solid var(--line); }
+  table.pnl td.total, table.pnl th.total { border-left: 2px solid var(--line); font-weight: 700; }
+  table.pnl td.empty { color: var(--muted); }
+  .pnl-empty { padding: 18px; color: var(--muted); }
+
   /* The one loud element: the emergency bar, fixed to the bottom like a guarded switch. */
   .estop {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
@@ -133,6 +149,30 @@
       <h2>Followers</h2>
       <div id="followers"></div>
     </section>
+
+    <section>
+      <h2>Daily P&amp;L</h2>
+      <div class="panel">
+        <div class="pnl-controls">
+          <label class="field" for="pnlPreset">Range
+            <select id="pnlPreset">
+              <option value="7">Last 7 days</option>
+              <option value="14" selected>Last 14 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="month">This month</option>
+              <option value="lastmonth">Last month</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <label class="field" for="pnlFrom">From <input id="pnlFrom" type="date"></label>
+          <label class="field" for="pnlTo">To <input id="pnlTo" type="date"></label>
+          <button id="pnlCsv" class="btn" type="button">Download CSV</button>
+        </div>
+        <div id="pnlBox" class="pnl-scroll"></div>
+        <p class="hint">Each day runs from 6 pm ET to the 5 pm ET close and shows the account's P&amp;L in NinjaTrader at the close (realized plus open), including any trades placed by hand. Today updates live.</p>
+      </div>
+    </section>
+
   </div>
 
   <div class="estop" role="region" aria-label="Emergency controls">
@@ -191,7 +231,7 @@
   function signOut(message) {
     adminKey = null;
     try { sessionStorage.removeItem(KEY_STORE); } catch (e) {}
-    clearInterval(timer);
+    clearInterval(timer); if (typeof pnlTimer !== "undefined") clearInterval(pnlTimer);
     $("app").hidden = true;
     $("login").hidden = false;
     $("loginError").textContent = message || "";
@@ -507,12 +547,112 @@
     }
   }
 
+  const PNL_URL = "/admin/pnl";
+
+  // ---------- daily P&L ----------
+  function ymd(d) { return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); }
+  function presetRange(name, todayStr) {
+    const t = new Date(todayStr + "T12:00:00");
+    const back = (n) => { const d = new Date(t); d.setDate(d.getDate() - n); return ymd(d); };
+    if (name === "7") return [back(6), todayStr];
+    if (name === "30") return [back(29), todayStr];
+    if (name === "month") return [ymd(new Date(t.getFullYear(), t.getMonth(), 1)), todayStr];
+    if (name === "lastmonth") return [ymd(new Date(t.getFullYear(), t.getMonth() - 1, 1)), ymd(new Date(t.getFullYear(), t.getMonth(), 0))];
+    return [back(13), todayStr];
+  }
+  function moneyCell(n, extraClass) {
+    if (n == null) return el("td", { class: "empty" + (extraClass ? " " + extraClass : ""), text: "–" });
+    const cls = (n < 0 ? "pos-short" : n > 0 ? "pos-long" : "") + (extraClass ? " " + extraClass : "");
+    return el("td", { class: cls, text: (n < 0 ? "−$" : "$") + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) });
+  }
+  function shortDay(d, today) {
+    if (d === today) return "Today";
+    const dt = new Date(d + "T12:00:00");
+    return dt.toLocaleDateString(undefined, { weekday: "short", month: "numeric", day: "numeric" });
+  }
+
+  let pnlData = null;
+  function pnlModel(data) {
+    const days = [...new Set(data.rows.map((r) => r.day))].sort();
+    const accounts = new Map();
+    data.rows.forEach((r) => {
+      if (!accounts.has(r.id)) accounts.set(r.id, { id: r.id, kind: r.kind, group: r.group, account: r.account, byDay: {} });
+      const a = accounts.get(r.id); a.byDay[r.day] = r.pnl; a.account = r.account || a.account;
+    });
+    const groups = new Map();
+    [...accounts.values()].sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "master" ? -1 : 1) || a.group.localeCompare(b.group) || a.id.localeCompare(b.id))
+      .forEach((a) => { const k = (a.kind === "master" ? "Masters: " : "") + a.group; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(a); });
+    return { days, groups };
+  }
+  function sum(list) { return list.reduce((t, n) => t + (n || 0), 0); }
+
+  function renderPnl() {
+    const box = $("pnlBox");
+    if (!pnlData || !pnlData.rows.length) {
+      box.replaceChildren(el("div", { class: "pnl-empty", text: "No P&L recorded in this range yet. Accounts are recorded while the market is open and their NinjaTrader is connected." }));
+      return;
+    }
+    const { days, groups } = pnlModel(pnlData);
+    const head = el("tr", {}, [el("th", { scope: "col", text: "Account" }), ...days.map((d) => el("th", { scope: "col", text: shortDay(d, pnlData.today) })), el("th", { scope: "col", class: "total", text: "Total" })]);
+    const body = [];
+    groups.forEach((list, name) => {
+      body.push(el("tr", { class: "group-row" }, [el("th", { colspan: String(days.length + 2), text: name })]));
+      list.forEach((a) => {
+        const vals = days.map((d) => a.byDay[d]);
+        body.push(el("tr", {}, [el("th", { scope: "row" }, [document.createTextNode(a.id), el("small", { text: a.account || "" })]),
+          ...vals.map((v) => moneyCell(v)), moneyCell(sum(vals), "total")]));
+      });
+      if (list.length > 1) {
+        const daySums = days.map((d) => list.some((a) => a.byDay[d] != null) ? sum(list.map((a) => a.byDay[d])) : null);
+        body.push(el("tr", { class: "subtotal" }, [el("th", { scope: "row", text: "Total " + name.replace("Masters: ", "") }),
+          ...daySums.map((v) => moneyCell(v)), moneyCell(sum(daySums), "total")]));
+      }
+    });
+    box.replaceChildren(el("table", { class: "pnl" }, [el("thead", {}, [head]), el("tbody", {}, body)]));
+  }
+
+  function pnlCsv() {
+    if (!pnlData || !pnlData.rows.length) { toast("Nothing to download for this range.", true); return; }
+    const { days, groups } = pnlModel(pnlData);
+    const q = (v) => '"' + String(v).replace(/"/g, '""') + '"';
+    const lines = [["Group", "Account ID", "NinjaTrader account", ...days, "Total"].map(q).join(",")];
+    groups.forEach((list, name) => list.forEach((a) => {
+      const vals = days.map((d) => a.byDay[d]);
+      lines.push([name, a.id, a.account || "", ...vals.map((v) => v == null ? "" : v.toFixed(2)), sum(vals).toFixed(2)].map(q).join(","));
+    }));
+    const blob = new Blob([lines.join("\r\n") + "\r\n"], { type: "text/csv" });
+    const a = el("a", { href: URL.createObjectURL(blob), download: "daily-pnl_" + pnlData.start + "_to_" + pnlData.end + ".csv" });
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  async function loadPnl() {
+    const qs = new URLSearchParams();
+    if ($("pnlFrom").value) qs.set("start", $("pnlFrom").value);
+    if ($("pnlTo").value) qs.set("end", $("pnlTo").value);
+    try {
+      pnlData = await api(PNL_URL + "?" + qs.toString());
+      if (!$("pnlFrom").value) { $("pnlFrom").value = pnlData.start; $("pnlTo").value = pnlData.end; }
+      renderPnl();
+    } catch (e) { if (e.message !== "unauthorized") toast(e.message, true); }
+  }
+  $("pnlPreset").addEventListener("change", () => {
+    if ($("pnlPreset").value === "custom") return;
+    const [a, b] = presetRange($("pnlPreset").value, (pnlData && pnlData.today) || ymd(new Date()));
+    $("pnlFrom").value = a; $("pnlTo").value = b; loadPnl();
+  });
+  ["pnlFrom", "pnlTo"].forEach((id) => $(id).addEventListener("change", () => { $("pnlPreset").value = "custom"; loadPnl(); }));
+  $("pnlCsv").addEventListener("click", pnlCsv);
+  let pnlTimer = null;
+
   function start() {
     $("login").hidden = true;
     $("app").hidden = false;
     refresh();
     clearInterval(timer);
     timer = setInterval(refresh, 3000);
+    loadPnl();
+    clearInterval(pnlTimer);
+    pnlTimer = setInterval(loadPnl, 60000);
   }
 
   $("loginForm").addEventListener("submit", (ev) => {

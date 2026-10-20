@@ -58,6 +58,60 @@ def trading_day() -> str:
     return (datetime.now(NEW_YORK) + timedelta(hours=6)).date().isoformat()
 
 
+def market_open(now: Optional[datetime] = None) -> bool:
+    """CME futures: Sunday 6 pm to Friday 5 pm New York time, with a daily break from 5 to 6 pm."""
+    t = now or datetime.now(NEW_YORK)
+    wd, hm = t.weekday(), t.hour * 60 + t.minute   # Monday = 0
+    if wd == 5:                      # Saturday
+        return False
+    if wd == 6:                      # Sunday: opens at 6 pm
+        return hm >= 18 * 60
+    if wd == 4 and hm >= 17 * 60:    # Friday after 5 pm
+        return False
+    return not (17 * 60 <= hm < 18 * 60)
+
+
+PNL_WRITE_EVERY_SEC = 15
+_pnl_last_write: dict = {}
+
+
+def record_pnl(kind: str, account_id: str, grp: str, nt_account: Optional[str], pnl: Optional[float]) -> None:
+    """Keeps each account's latest P&L for the current trading day. Nothing is written while the market is
+    closed, so the number saved at the 5 pm ET close is the day's final P&L even if NinjaTrader resets it later."""
+    if pnl is None or not market_open():
+        return
+    now = time.time()
+    if now - _pnl_last_write.get(account_id, 0) < PNL_WRITE_EVERY_SEC:
+        return
+    _pnl_last_write[account_id] = now
+    DB.execute("insert or replace into daily_pnl values (?, ?, ?, ?, ?, ?, ?)",
+               (trading_day(), account_id, kind, grp, nt_account or "", float(pnl), now))
+    DB.commit()
+
+
+def pnl_history(start: Optional[str], end: Optional[str], ids: Optional[list] = None) -> dict:
+    today = trading_day()
+    try:
+        end_d = datetime.strptime(end, "%Y-%m-%d").date() if end else datetime.strptime(today, "%Y-%m-%d").date()
+        start_d = datetime.strptime(start, "%Y-%m-%d").date() if start else end_d - timedelta(days=13)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must look like 2026-10-20.")
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+    if (end_d - start_d).days > 400:
+        raise HTTPException(status_code=400, detail="Pick a range of about a year or less.")
+    q = "select day, account_id, kind, grp, nt_account, pnl from daily_pnl where day between ? and ?"
+    args = [start_d.isoformat(), end_d.isoformat()]
+    if ids is not None:
+        if not ids:
+            return {"start": args[0], "end": args[1], "today": today, "rows": []}
+        q += " and account_id in (%s)" % ",".join("?" * len(ids))
+        args += ids
+    rows = [dict(zip(("day", "id", "kind", "group", "account", "pnl"), r))
+            for r in DB.execute(q + " order by day, kind, grp, account_id", args)]
+    return {"start": args[0], "end": args[1], "today": today, "rows": rows}
+
+
 RECON_STRIKES = 3               # consecutive 5s checks with mismatched positions before alerting
 
 with open(CONFIG_PATH) as f:
@@ -66,6 +120,9 @@ with open(CONFIG_PATH) as f:
 DB = sqlite3.connect(DB_PATH, check_same_thread=False)
 DB.execute("create table if not exists events (ts real, source text, who text, body text)")
 DB.execute("create table if not exists settings (k text primary key, v text)")
+DB.execute("""create table if not exists daily_pnl (
+    day text, account_id text, kind text, grp text, nt_account text, pnl real, updated real,
+    primary key (day, account_id))""")
 DB.commit()
 
 
@@ -420,6 +477,7 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
                 ms["pnl"] = float(parts[5])
             except ValueError:
                 pass
+        record_pnl("master", master["id"], group_of(master), ms["account"], ms["pnl"])
         await check_master_profit(master["id"], ms)
         return master_reply(master["id"], ms)
 
@@ -465,6 +523,7 @@ async def follower_socket(ws: WebSocket):
                     fs.account = parts[3] or None
                 if len(parts) > 4:
                     fs.accounts = sorted(a for a in parts[4].split(",") if a)
+                record_pnl("follower", fs.id, group_of(fs.cfg), fs.account, fs.pnl)
                 await check_loss_limit(fs)
             elif parts[0] == "ack":
                 log_event("ack", fs.id, text)
@@ -984,3 +1043,19 @@ async def admin_sync(follower_id: str, x_admin_key: Optional[str] = Header(defau
 async def my_sync(id: Optional[str] = None, x_follower_key: Optional[str] = Header(default=None)):
     fs = my_follower(x_follower_key, id)
     return await sync_follower(fs, fs.id)
+
+
+# ---------- daily P&L history ----------
+
+@app.get("/admin/pnl")
+async def admin_pnl(start: Optional[str] = None, end: Optional[str] = None,
+                    x_admin_key: Optional[str] = Header(default=None)):
+    require_admin(x_admin_key)
+    return pnl_history(start, end)
+
+
+@app.get("/me/follower/pnl")
+async def my_follower_pnl(start: Optional[str] = None, end: Optional[str] = None,
+                          x_follower_key: Optional[str] = Header(default=None)):
+    mine = [fs.id for fs in my_followers(x_follower_key)]
+    return pnl_history(start, end, mine)
