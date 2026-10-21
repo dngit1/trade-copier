@@ -168,6 +168,7 @@ class FollowerState:
         self.loss_day: Optional[str] = None       # trading day a daily limit was hit
         self.last_hb = 0.0
         self.pnl = 0.0
+        self.open_pnl: Optional[float] = None   # open-position P&L (None until the add-on reports it)
         self.positions: dict = {}
         self.account: Optional[str] = None
         self.accounts: list = []
@@ -187,7 +188,7 @@ def group_of(cfg: dict) -> str:
 MASTER_STATE = {
     m["id"]: {"last_hb": 0.0, "positions": {}, "offline_alerted": False,
               "account": None, "accounts": [], "commands": [], "orders": [],
-              "pnl": None, "locked_day": None, "armed": True, "last_flatten_at": 0.0,
+              "pnl": None, "open_pnl": None, "locked_day": None, "armed": True, "last_flatten_at": 0.0,
               "paused": bool((load_setting(f"master:{m['id']}") or {}).get("paused", False)),
               "daily_profit_target": float((load_setting(f"master:{m['id']}") or {}).get(
                   "daily_profit_target", m.get("daily_profit_target", 0)) or 0)}
@@ -485,6 +486,11 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
                 ms["pnl"] = float(parts[5])
             except ValueError:
                 pass
+        if len(parts) > 6:
+            try:
+                ms["open_pnl"] = float(parts[6]) if parts[6] else None
+            except ValueError:
+                pass
         record_pnl("master", master["id"], group_of(master), ms["account"], ms["pnl"])
         await check_master_profit(master["id"], ms)
         return master_reply(master["id"], ms)
@@ -531,6 +537,11 @@ async def follower_socket(ws: WebSocket):
                     fs.account = parts[3] or None
                 if len(parts) > 4:
                     fs.accounts = sorted(a for a in parts[4].split(",") if a)
+                if len(parts) > 5:
+                    try:
+                        fs.open_pnl = float(parts[5]) if parts[5] else None
+                    except ValueError:
+                        pass
                 record_pnl("follower", fs.id, group_of(fs.cfg), fs.account, fs.pnl)
                 await check_loss_limit(fs)
             elif parts[0] == "ack":
@@ -598,6 +609,7 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
                 "pending_commands": [c for _, c in ms["commands"]],
                 "orders": ms["orders"],
                 "pnl": ms["pnl"],
+                "open_pnl": ms["open_pnl"],
                 "daily_profit_target": ms["daily_profit_target"],
                 "locked": master_locked(ms),
                 "paused": ms["paused"],
@@ -610,6 +622,7 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
                 "paused": fs.paused,
                 "pause_reason": fs.pause_reason,
                 "pnl": fs.pnl,
+                "open_pnl": fs.open_pnl,
                 "positions": fs.positions,
                 "master": fs.cfg["master_id"],
                 "group": group_of(fs.cfg),
@@ -814,6 +827,8 @@ def master_slot_status(m: dict) -> dict:
         "accounts": ms["accounts"],
         "switching_to": switching,
         "pnl": ms["pnl"],
+        "open_pnl": ms["open_pnl"],
+        "positions": ms["positions"],
         "daily_profit_target": ms["daily_profit_target"],
         "locked": master_locked(ms),
         "paused": ms["paused"],
@@ -926,6 +941,7 @@ def follower_slot_status(fs: FollowerState) -> dict:
         "paused": fs.paused,
         "pause_reason": fs.pause_reason,
         "pnl": fs.pnl,
+        "open_pnl": fs.open_pnl,
         "positions": fs.positions,
         "account": fs.account,
         "accounts": fs.accounts,

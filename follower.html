@@ -134,7 +134,8 @@
     <div class="card">
       <h2>Today</h2>
       <dl>
-        <div><dt>P&amp;L</dt><dd id="pnl">–</dd></div>
+        <div><dt>Today's P&amp;L</dt><dd id="pnl">–</dd></div>
+        <div><dt>Open position P&amp;L</dt><dd id="openPnl">–</dd></div>
         <div><dt>My position</dt><dd id="myPos">–</dd></div>
       </dl>
     </div>
@@ -328,6 +329,12 @@
     pnl.textContent = (s.pnl < 0 ? "−$" : "$") + Math.abs(s.pnl).toFixed(2);
     pnl.className = s.pnl < 0 ? "t-bad" : s.pnl > 0 ? "t-good" : "";
     $("myPos").textContent = posText(s.positions);
+    const op = $("openPnl");
+    if (s.open_pnl == null) { op.textContent = "–"; op.className = ""; }
+    else {
+      op.textContent = (s.open_pnl < 0 ? "−$" : "$") + Math.abs(s.open_pnl).toFixed(2);
+      op.className = s.open_pnl < 0 ? "t-bad" : s.open_pnl > 0 ? "t-good" : "";
+    }
     $("mismatchNote").hidden = !s.mismatch;
     $("syncBtn").disabled = !m.online || !s.ninjatrader_connected || (s.paused && ["loss_limit", "profit_target"].includes(s.pause_reason)) || s.master.locked || s.master.paused;
 
@@ -523,7 +530,7 @@
   }
   function renderPnl() {
     const box = $("pnlBox");
-    if (!pnlData || !pnlData.rows.length) {
+    if (!pnlData || !Array.isArray(pnlData.rows) || !pnlData.rows.length) {
       box.replaceChildren(mk("p", { class: "muted", text: "No P&L recorded in this range yet. Days are recorded while the market is open and your NinjaTrader is connected." }));
       return;
     }
@@ -543,7 +550,7 @@
     box.replaceChildren(mk("table", { class: "pnl" }, [mk("thead", {}, [head]), mk("tbody", {}, rows), mk("tfoot", {}, [foot])]));
   }
   function pnlCsv() {
-    if (!pnlData || !pnlData.rows.length) { toast("Nothing to download for this range.", true); return; }
+    if (!pnlData || !Array.isArray(pnlData.rows) || !pnlData.rows.length) { toast("Nothing to download for this range.", true); return; }
     const { days, ids, val, slotOf } = pnlModel(pnlData);
     const q = (v) => '"' + String(v).replace(/"/g, '""') + '"';
     const lines = [["Day", ...ids.map((i) => i + " (" + slotOf[i] + ")"), "Total"].map(q).join(",")];

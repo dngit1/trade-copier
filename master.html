@@ -75,6 +75,7 @@
   .tab .dot.good { color: var(--good); } .tab .dot.bad { color: var(--bad); } .tab .dot.amber { color: var(--amber); }
   body.compact .tabs { margin-bottom: 8px; } body.compact .tab { padding: 5px 10px; font-size: 14px; }
   .btn.outline { background: transparent; color: var(--bad); border: 2px solid var(--bad); margin-top: 10px; }
+  .pnl-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -115,8 +116,11 @@
     </div>
 
     <form id="profitForm" class="card">
-      <div class="label">Today's P&amp;L</div>
-      <div id="pnl" class="big">–</div>
+      <div class="pnl-pair">
+        <div><div class="label">Today's P&amp;L</div><div id="pnl" class="big">–</div></div>
+        <div><div class="label">Open position P&amp;L</div><div id="openPnl" class="big">–</div></div>
+      </div>
+      <p id="masterPos" class="muted"></p>
       <p id="lockNote" class="muted bad" hidden>Daily max profit reached. The master and all followers were flattened, and copying is stopped until the next session (6 pm ET).</p>
       <label class="field" for="profitInput" style="margin-top:12px">Daily max profit ($)
         <input id="profitInput" type="number" step="50" min="0" inputmode="decimal" required>
@@ -231,6 +235,12 @@
     const pnl = $("pnl");
     pnl.textContent = money(s.pnl);
     pnl.className = "big" + (s.pnl < 0 ? " bad" : s.pnl > 0 ? " good" : "");
+    const op = $("openPnl");
+    op.textContent = money(s.open_pnl);
+    op.className = "big" + (s.open_pnl < 0 ? " bad" : s.open_pnl > 0 ? " good" : "");
+    const posEntries = Object.entries(s.positions || {}).filter(([, q]) => q);
+    $("masterPos").textContent = "Position: " + (posEntries.length
+      ? posEntries.map(([i, q]) => (q > 0 ? "Long " : "Short ") + Math.abs(q) + " " + i).join(", ") : "Flat");
     $("lockNote").hidden = !s.locked;
 
     const cs = $("copyState");
