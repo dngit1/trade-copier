@@ -78,14 +78,16 @@ _pnl_last_write: dict = {}
 def record_pnl(kind: str, account_id: str, grp: str, nt_account: Optional[str], pnl: Optional[float]) -> None:
     """Keeps each account's latest P&L for the current trading day. Nothing is written while the market is
     closed, so the number saved at the 5 pm ET close is the day's final P&L even if NinjaTrader resets it later."""
-    if pnl is None or not market_open():
+    if pnl is None or not nt_account or not market_open():
         return
     now = time.time()
-    if now - _pnl_last_write.get(account_id, 0) < PNL_WRITE_EVERY_SEC:
+    cache_key = account_id + "|" + nt_account
+    if now - _pnl_last_write.get(cache_key, 0) < PNL_WRITE_EVERY_SEC:
         return
-    _pnl_last_write[account_id] = now
-    DB.execute("insert or replace into daily_pnl values (?, ?, ?, ?, ?, ?, ?)",
-               (trading_day(), account_id, kind, grp, nt_account or "", float(pnl), now))
+    _pnl_last_write[cache_key] = now
+    DB.execute("insert or replace into daily_pnl_v2 (day, nt_account, account_id, kind, grp, pnl, updated) "
+               "values (?, ?, ?, ?, ?, ?, ?)",
+               (trading_day(), nt_account, account_id, kind, grp, float(pnl), now))
     DB.commit()
 
 
@@ -100,7 +102,7 @@ def pnl_history(start: Optional[str], end: Optional[str], ids: Optional[list] = 
         start_d, end_d = end_d, start_d
     if (end_d - start_d).days > 400:
         raise HTTPException(status_code=400, detail="Pick a range of about a year or less.")
-    q = "select day, account_id, kind, grp, nt_account, pnl from daily_pnl where day between ? and ?"
+    q = "select day, account_id, kind, grp, nt_account, pnl from daily_pnl_v2 where day between ? and ?"
     args = [start_d.isoformat(), end_d.isoformat()]
     if ids is not None:
         if not ids:
@@ -108,7 +110,7 @@ def pnl_history(start: Optional[str], end: Optional[str], ids: Optional[list] = 
         q += " and account_id in (%s)" % ",".join("?" * len(ids))
         args += ids
     rows = [dict(zip(("day", "id", "kind", "group", "account", "pnl"), r))
-            for r in DB.execute(q + " order by day, kind, grp, account_id", args)]
+            for r in DB.execute(q + " order by day, kind, grp, nt_account", args)]
     return {"start": args[0], "end": args[1], "today": today, "rows": rows}
 
 
@@ -120,9 +122,15 @@ with open(CONFIG_PATH) as f:
 DB = sqlite3.connect(DB_PATH, check_same_thread=False)
 DB.execute("create table if not exists events (ts real, source text, who text, body text)")
 DB.execute("create table if not exists settings (k text primary key, v text)")
-DB.execute("""create table if not exists daily_pnl (
-    day text, account_id text, kind text, grp text, nt_account text, pnl real, updated real,
-    primary key (day, account_id))""")
+# Daily P&L is kept per NinjaTrader account number, so each account has its own history even if a
+# copier slot is switched to a different account.
+DB.execute("""create table if not exists daily_pnl_v2 (
+    day text, nt_account text, account_id text, kind text, grp text, pnl real, updated real,
+    primary key (day, nt_account, account_id))""")
+_old = DB.execute("select name from sqlite_master where type='table' and name='daily_pnl'").fetchone()
+if _old and not DB.execute("select 1 from daily_pnl_v2 limit 1").fetchone():
+    DB.execute("""insert or ignore into daily_pnl_v2 (day, nt_account, account_id, kind, grp, pnl, updated)
+                  select day, nt_account, account_id, kind, grp, pnl, updated from daily_pnl where nt_account != ''""")
 DB.commit()
 
 

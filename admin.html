@@ -137,7 +137,7 @@
   <div class="wrap">
     <header class="top">
       <h1>Trade Copier Control</h1>
-      <div><span id="updated" class="updated">Connecting…</span> <button id="signout" class="signout" type="button">Sign out</button></div>
+      <div><span id="updated" class="updated">Connecting…</span> <a class="signout" href="#pnlSection">Daily P&amp;L</a> <button id="signout" class="signout" type="button">Sign out</button></div>
     </header>
 
     <section>
@@ -150,7 +150,7 @@
       <div id="followers"></div>
     </section>
 
-    <section>
+    <section id="pnlSection">
       <h2>Daily P&amp;L</h2>
       <div class="panel">
         <div class="pnl-controls">
@@ -169,7 +169,7 @@
           <button id="pnlCsv" class="btn" type="button">Download CSV</button>
         </div>
         <div id="pnlBox" class="pnl-scroll"></div>
-        <p class="hint">Each day runs from 6 pm ET to the 5 pm ET close and shows the account's P&amp;L in NinjaTrader at the close (realized plus open), including any trades placed by hand. Today updates live.</p>
+        <p class="hint">Each day runs from 6 pm ET to the 5 pm ET close and shows the account's P&amp;L in NinjaTrader at the close (realized plus open), including any trades placed by hand. Each row is one NinjaTrader account number; the copier slot it ran under is shown below it. Today updates live.</p>
       </div>
     </section>
 
@@ -576,12 +576,13 @@
     const days = [...new Set(data.rows.map((r) => r.day))].sort();
     const accounts = new Map();
     data.rows.forEach((r) => {
-      if (!accounts.has(r.id)) accounts.set(r.id, { id: r.id, kind: r.kind, group: r.group, account: r.account, byDay: {} });
-      const a = accounts.get(r.id); a.byDay[r.day] = r.pnl; a.account = r.account || a.account;
+      const k = r.account + "|" + r.id;
+      if (!accounts.has(k)) accounts.set(k, { id: r.id, kind: r.kind, group: r.group, account: r.account, byDay: {} });
+      accounts.get(k).byDay[r.day] = r.pnl;
     });
     const groups = new Map();
-    [...accounts.values()].sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "master" ? -1 : 1) || a.group.localeCompare(b.group) || a.id.localeCompare(b.id))
-      .forEach((a) => { const k = (a.kind === "master" ? "Masters: " : "") + a.group; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(a); });
+    [...accounts.values()].sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "master" ? -1 : 1) || a.group.localeCompare(b.group) || a.account.localeCompare(b.account))
+      .forEach((a) => { const k = (a.kind === "master" ? "Masters: " : "Followers: ") + a.group; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(a); });
     return { days, groups };
   }
   function sum(list) { return list.reduce((t, n) => t + (n || 0), 0); }
@@ -593,18 +594,18 @@
       return;
     }
     const { days, groups } = pnlModel(pnlData);
-    const head = el("tr", {}, [el("th", { scope: "col", text: "Account" }), ...days.map((d) => el("th", { scope: "col", text: shortDay(d, pnlData.today) })), el("th", { scope: "col", class: "total", text: "Total" })]);
+    const head = el("tr", {}, [el("th", { scope: "col", text: "Account number" }), ...days.map((d) => el("th", { scope: "col", text: shortDay(d, pnlData.today) })), el("th", { scope: "col", class: "total", text: "Total" })]);
     const body = [];
     groups.forEach((list, name) => {
       body.push(el("tr", { class: "group-row" }, [el("th", { colspan: String(days.length + 2), text: name })]));
       list.forEach((a) => {
         const vals = days.map((d) => a.byDay[d]);
-        body.push(el("tr", {}, [el("th", { scope: "row" }, [document.createTextNode(a.id), el("small", { text: a.account || "" })]),
+        body.push(el("tr", {}, [el("th", { scope: "row" }, [document.createTextNode(a.account), el("small", { text: "copier slot " + a.id })]),
           ...vals.map((v) => moneyCell(v)), moneyCell(sum(vals), "total")]));
       });
       if (list.length > 1) {
         const daySums = days.map((d) => list.some((a) => a.byDay[d] != null) ? sum(list.map((a) => a.byDay[d])) : null);
-        body.push(el("tr", { class: "subtotal" }, [el("th", { scope: "row", text: "Total " + name.replace("Masters: ", "") }),
+        body.push(el("tr", { class: "subtotal" }, [el("th", { scope: "row", text: "Total " + name.replace("Masters: ", "").replace("Followers: ", "") }),
           ...daySums.map((v) => moneyCell(v)), moneyCell(sum(daySums), "total")]));
       }
     });
@@ -615,10 +616,10 @@
     if (!pnlData || !pnlData.rows.length) { toast("Nothing to download for this range.", true); return; }
     const { days, groups } = pnlModel(pnlData);
     const q = (v) => '"' + String(v).replace(/"/g, '""') + '"';
-    const lines = [["Group", "Account ID", "NinjaTrader account", ...days, "Total"].map(q).join(",")];
+    const lines = [["Group", "Account number", "Copier slot", ...days, "Total"].map(q).join(",")];
     groups.forEach((list, name) => list.forEach((a) => {
       const vals = days.map((d) => a.byDay[d]);
-      lines.push([name, a.id, a.account || "", ...vals.map((v) => v == null ? "" : v.toFixed(2)), sum(vals).toFixed(2)].map(q).join(","));
+      lines.push([name, a.account, a.id, ...vals.map((v) => v == null ? "" : v.toFixed(2)), sum(vals).toFixed(2)].map(q).join(","));
     }));
     const blob = new Blob([lines.join("\r\n") + "\r\n"], { type: "text/csv" });
     const a = el("a", { href: URL.createObjectURL(blob), download: "daily-pnl_" + pnlData.start + "_to_" + pnlData.end + ".csv" });

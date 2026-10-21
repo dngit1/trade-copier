@@ -187,7 +187,7 @@
         <button id="pnlCsv" class="btn" type="button">Download CSV</button>
       </div>
       <div id="pnlBox" class="pnl-scroll"></div>
-      <p class="muted">Each day ends at the 5 pm ET close and shows the account's P&amp;L in NinjaTrader at the close, including trades placed by hand. Today updates live.</p>
+      <p class="muted">Each day ends at the 5 pm ET close and shows each account number's P&amp;L in NinjaTrader at the close, including trades placed by hand. Today updates live.</p>
     </div>
 
     <button id="signout" class="link" type="button">Sign out</button>
@@ -513,10 +513,13 @@
   let pnlData = null;
   function pnlModel(data) {
     const days = [...new Set(data.rows.map((r) => r.day))].sort().reverse();
-    const ids = [...new Set(data.rows.map((r) => r.id))].sort();
+    // One column per NinjaTrader account number.
+    const ids = [...new Set(data.rows.map((r) => r.account))].sort();
+    const slotOf = {};
+    data.rows.forEach((r) => { slotOf[r.account] = r.id; });
     const val = {};
-    data.rows.forEach((r) => { val[r.day + "|" + r.id] = r.pnl; });
-    return { days, ids, val };
+    data.rows.forEach((r) => { val[r.day + "|" + r.account] = r.pnl; });
+    return { days, ids, val, slotOf };
   }
   function renderPnl() {
     const box = $("pnlBox");
@@ -524,9 +527,10 @@
       box.replaceChildren(mk("p", { class: "muted", text: "No P&L recorded in this range yet. Days are recorded while the market is open and your NinjaTrader is connected." }));
       return;
     }
-    const { days, ids, val } = pnlModel(pnlData);
+    const { days, ids, val, slotOf } = pnlModel(pnlData);
     const many = ids.length > 1;
-    const head = mk("tr", {}, [mk("th", { scope: "col", text: "Day" }), ...ids.map((i) => mk("th", { scope: "col", text: i })),
+    const head = mk("tr", {}, [mk("th", { scope: "col", text: "Day" }),
+      ...ids.map((i) => mk("th", { scope: "col", title: "copier slot " + slotOf[i] }, [document.createTextNode(i)])),
       ...(many ? [mk("th", { scope: "col", class: "total", text: "Total" })] : [])]);
     const rows = days.map((d) => {
       const vals = ids.map((i) => val[d + "|" + i]);
@@ -540,9 +544,9 @@
   }
   function pnlCsv() {
     if (!pnlData || !pnlData.rows.length) { toast("Nothing to download for this range.", true); return; }
-    const { days, ids, val } = pnlModel(pnlData);
+    const { days, ids, val, slotOf } = pnlModel(pnlData);
     const q = (v) => '"' + String(v).replace(/"/g, '""') + '"';
-    const lines = [["Day", ...ids, "Total"].map(q).join(",")];
+    const lines = [["Day", ...ids.map((i) => i + " (" + slotOf[i] + ")"), "Total"].map(q).join(",")];
     days.slice().reverse().forEach((d) => {
       const vals = ids.map((i) => val[d + "|" + i]);
       lines.push([d, ...vals.map((v) => v == null ? "" : v.toFixed(2)), add(vals).toFixed(2)].map(q).join(","));
