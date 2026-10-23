@@ -163,8 +163,9 @@ class FollowerState:
             self.cfg["master_id"] = cfg.get("master_id") if cfg.get("master_id") in MASTER_IDS else MASTER_IDS[0]
         self.id = cfg["id"]
         self.ws: Optional[WebSocket] = None
-        self.paused = False
-        self.pause_reason: Optional[str] = None   # "loss_limit", "profit_target" or "manual"
+        # A stop/pause made on the pages or admin page is saved, so it survives restarts and redeploys.
+        self.paused = bool((saved or {}).get("paused", False))
+        self.pause_reason: Optional[str] = "manual" if self.paused else None   # "loss_limit", "profit_target" or "manual"
         self.loss_day: Optional[str] = None       # trading day a daily limit was hit
         self.last_hb = 0.0
         self.pnl = 0.0
@@ -176,6 +177,17 @@ class FollowerState:
         self.last_error_at = 0.0
         self.strikes = 0
         self.stale_alerted = False
+
+
+def set_manual_pause(fs: "FollowerState", paused: bool) -> None:
+    """Pause or resume a follower and save it, so the choice survives restarts and redeploys.
+    (Daily loss limit / max profit stops are not saved here: they end on their own at the next session.)"""
+    fs.paused = paused
+    fs.pause_reason = "manual" if paused else None
+    saved = load_setting(f"follower:{fs.id}") or {}
+    if saved.get("paused", False) != paused:
+        saved["paused"] = paused
+        save_setting(f"follower:{fs.id}", saved)
 
 
 MASTERS = {m["key"]: m for m in CFG["masters"]}
@@ -365,8 +377,7 @@ async def maybe_auto_resume(fs: "FollowerState", now: float) -> None:
     if daily_limit_hit(fs):
         return  # NinjaTrader hasn't reset the day's P&L yet; check again in 5 seconds
     reason = "loss limit" if fs.pause_reason == "loss_limit" else "max profit"
-    fs.paused = False
-    fs.pause_reason = None
+    set_manual_pause(fs, False)
     fs.strikes = 0
     await alert(f"{fs.id}: new trading session, copying resumed automatically after yesterday's daily {reason}")
 
@@ -718,8 +729,7 @@ async def switch_master_account(master_id: str, body: dict = Body(...),
 async def kill_switch(x_admin_key: Optional[str] = Header(default=None)):
     require_admin(x_admin_key)
     for fs in FOLLOWERS:
-        fs.paused = True
-        fs.pause_reason = "manual"
+        set_manual_pause(fs, True)
         await send(fs, "flatten", "ALL")
     await alert("KILL SWITCH: all followers flattened and paused")
     return {"ok": True}
@@ -730,8 +740,7 @@ async def kill_all(x_admin_key: Optional[str] = Header(default=None)):
     """Flatten and pause every follower, AND flatten the master account(s)."""
     require_admin(x_admin_key)
     for fs in FOLLOWERS:
-        fs.paused = True
-        fs.pause_reason = "manual"
+        set_manual_pause(fs, True)
         await send(fs, "flatten", "ALL")
     now = time.time()
     offline = []
@@ -748,8 +757,7 @@ async def kill_all(x_admin_key: Optional[str] = Header(default=None)):
 async def pause(follower_id: str, flatten: bool = False, x_admin_key: Optional[str] = Header(default=None)):
     require_admin(x_admin_key)
     fs = get_follower(follower_id)
-    fs.paused = True
-    fs.pause_reason = "manual"
+    set_manual_pause(fs, True)
     if flatten:
         await send(fs, "flatten", "ALL")
     await alert(f"{fs.id} paused (flatten={flatten})")
@@ -760,8 +768,7 @@ async def pause(follower_id: str, flatten: bool = False, x_admin_key: Optional[s
 async def resume(follower_id: str, x_admin_key: Optional[str] = Header(default=None)):
     require_admin(x_admin_key)
     fs = get_follower(follower_id)
-    fs.paused = False
-    fs.pause_reason = None
+    set_manual_pause(fs, False)
     fs.strikes = 0
     await alert(f"{fs.id} resumed")
     return {"ok": True}
@@ -1013,8 +1020,7 @@ async def admin_follower_account(follower_id: str, body: dict = Body(...),
 async def my_follower_stop(flatten: bool = False, id: Optional[str] = None,
                            x_follower_key: Optional[str] = Header(default=None)):
     fs = my_follower(x_follower_key, id)
-    fs.paused = True
-    fs.pause_reason = "manual"
+    set_manual_pause(fs, True)
     if flatten:
         await send(fs, "flatten", "ALL")
     await alert(f"{fs.id} stopped copying from the follower page (closed positions: {flatten})")
@@ -1024,8 +1030,7 @@ async def my_follower_stop(flatten: bool = False, id: Optional[str] = None,
 @app.post("/me/follower/start")
 async def my_follower_start(id: Optional[str] = None, x_follower_key: Optional[str] = Header(default=None)):
     fs = my_follower(x_follower_key, id)
-    fs.paused = False
-    fs.pause_reason = None
+    set_manual_pause(fs, False)
     fs.strikes = 0
     await alert(f"{fs.id} resumed copying from the follower page")
     await check_loss_limit(fs)
@@ -1049,8 +1054,7 @@ async def sync_follower(fs: FollowerState, by: str) -> dict:
     targets = {i: expected_position(p, fs) for i, p in ms["positions"].items() if p}
     pos_text = ";".join(f"{i}={q}" for i, q in targets.items())
     orders_text = ";".join("~".join(str(o[k]) for k in ORDER_FIELDS) for o in scaled_orders(ms["orders"], fs))
-    fs.paused = False
-    fs.pause_reason = None
+    set_manual_pause(fs, False)
     fs.strikes = 0
     await send(fs, "sync", f"{pos_text}|{orders_text}")
     await alert(f"{fs.id} synced to master by {by}: target {targets or 'flat'}, {len(ms['orders'])} working order(s)")
