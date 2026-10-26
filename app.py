@@ -298,11 +298,13 @@ async def fan_out(master_id: str, parts: list) -> None:
         await send(fs, kind, f"{oid}|{inst}|{action}|{otype}|{q}|{limit}|{stop}|{oco}|{tif}")
 
 
-async def follow_master_flat(master_id: str, inst: str) -> None:
+async def follow_master_flat(master_id: str, inst: str, keep: Optional[str] = None) -> None:
     if MASTER_STATE[master_id]["paused"]:
         return  # copying is paused from the master page: the master trades on its own
     # Master orders still working in this instrument (e.g. a new entry limit) must not be cleared.
-    keep = ",".join(o["id"] for o in MASTER_STATE[master_id]["orders"] if o["instrument"] == inst)
+    # The master add-on (v9+) sends this list itself the moment it goes flat; otherwise use the last heartbeat.
+    if keep is None:
+        keep = ",".join(o["id"] for o in MASTER_STATE[master_id]["orders"] if o["instrument"] == inst)
     sent = []
     for fs in FOLLOWERS:
         if fs.cfg["master_id"] != master_id or fs.paused or fs.ws is None:
@@ -382,6 +384,20 @@ async def maybe_auto_resume(fs: "FollowerState", now: float) -> None:
     await alert(f"{fs.id}: new trading session, copying resumed automatically after yesterday's daily {reason}")
 
 
+async def close_leftovers(fs: "FollowerState", ms: dict, expected: dict, actual: dict) -> None:
+    """The master is flat in an instrument but the follower still holds a position there (for example the
+    master's limit target filled but the follower's didn't, or the master was in and out between heartbeats).
+    Close it. Only runs after the mismatch has lasted RECON_STRIKES checks (~15 s), so normal fill delays
+    never trigger it."""
+    if not master_online(ms) or ms["paused"] or fs.paused:
+        return
+    for inst, qty in actual.items():
+        if qty and not expected.get(inst):
+            keep = ",".join(o["id"] for o in ms["orders"] if o["instrument"] == inst)
+            await send(fs, "flatcheck", f"{inst}|{keep}")
+            await alert(f"{fs.id}: master is flat in {inst} but {fs.id} still held {qty}; closing it")
+
+
 async def monitor() -> None:
     while True:
         await asyncio.sleep(5)
@@ -408,6 +424,7 @@ async def monitor() -> None:
                 fs.strikes += 1
                 if fs.strikes == RECON_STRIKES:
                     await alert(f"Position mismatch for {fs.id}: expected {expected}, has {actual}")
+                    await close_leftovers(fs, ms, expected, actual)
             else:
                 fs.strikes = 0
 
@@ -507,6 +524,11 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
         return master_reply(master["id"], ms)
 
     log_event("master", master["id"], body)
+    if parts[0] == "order" and len(parts) >= 3 and parts[1] == "flat":
+        # Sent by the master add-on the instant it goes flat in an instrument, even for trades shorter than
+        # a heartbeat. Followers close leftovers and cancel copied orders the master no longer has.
+        await follow_master_flat(master["id"], parts[2], parts[3] if len(parts) > 3 else "")
+        return master_reply(master["id"], ms)
     if parts[0] == "order" and len(parts) >= 3 and parts[1] in ("new", "change", "cancel"):
         if parts[1] != "cancel" and len(parts) < 11:
             raise HTTPException(status_code=400, detail="malformed order message")
