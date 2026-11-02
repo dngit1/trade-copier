@@ -170,6 +170,9 @@ class FollowerState:
         self.last_hb = 0.0
         self.pnl = 0.0
         self.open_pnl: Optional[float] = None   # open-position P&L (None until the add-on reports it)
+        self.local_cap: Optional[int] = None    # max contracts from follower.txt on that computer (v9+ add-on)
+        self.limit_day: Optional[str] = None    # trading day a daily loss limit / max profit was hit
+        self.limits_sent_day: Optional[str] = None
         self.positions: dict = {}
         self.account: Optional[str] = None
         self.accounts: list = []
@@ -254,11 +257,19 @@ def scaled_orders(orders: list, fs: "FollowerState") -> list:
     return [dict(o, qty=scale_qty(o["qty"], fs)) for o in orders]
 
 
+def effective_cap(fs: "FollowerState") -> int:
+    """The lower of the website's max contracts and the follower.txt ceiling on that computer."""
+    cap = int(fs.cfg.get("max_contracts", 1000))
+    if fs.local_cap:
+        cap = min(cap, int(fs.local_cap))
+    return cap
+
+
 def scale_qty(qty: int, fs: FollowerState) -> int:
     if qty <= 0:
         return 0
     scaled = max(1, round(qty * float(fs.cfg.get("multiplier", 1.0))))
-    return min(scaled, int(fs.cfg.get("max_contracts", scaled)))
+    return min(scaled, effective_cap(fs))
 
 
 def expected_position(master_pos: int, fs: FollowerState) -> int:
@@ -408,6 +419,8 @@ async def monitor() -> None:
                 await alert(f"Master {mid} stopped sending heartbeats")
         for fs in FOLLOWERS:
             await maybe_auto_resume(fs, now)
+            if fs.ws is not None and fs.limits_sent_day != trading_day():
+                await send_limits(fs)
             if fs.ws is None or fs.paused:
                 fs.strikes = 0
                 continue
@@ -554,6 +567,7 @@ async def follower_socket(ws: WebSocket):
     fs.last_hb = time.time()
     log.info("Follower %s connected", fs.id)
     log_event("connect", fs.id, "")
+    await send_limits(fs)
     first_hb = True
     try:
         while True:
@@ -575,8 +589,17 @@ async def follower_socket(ws: WebSocket):
                         fs.open_pnl = float(parts[5]) if parts[5] else None
                     except ValueError:
                         pass
+                if len(parts) > 6 and parts[6].isdigit():
+                    fs.local_cap = int(parts[6])
                 record_pnl("follower", fs.id, group_of(fs.cfg), fs.account, fs.pnl)
                 await check_loss_limit(fs)
+            elif parts[0] == "limit" and len(parts) >= 3:
+                # The follower add-on (v9+) checks its limits every second and has already flattened.
+                try:
+                    fs.pnl = float(parts[2])
+                except ValueError:
+                    pass
+                await on_limit_hit(fs, parts[1] if parts[1] in DAILY_STOP_REASONS else "loss_limit", from_addon=True)
             elif parts[0] == "ack":
                 log_event("ack", fs.id, text)
                 if len(parts) > 2 and parts[2] == "err":
@@ -601,16 +624,55 @@ def daily_limit_hit(fs: FollowerState) -> Optional[str]:
     return None
 
 
+async def send_limits(fs: FollowerState) -> None:
+    """Tell the follower add-on its daily limits so it can enforce them every second.
+    armed=0 means a limit was already hit today (don't act again until the next session)."""
+    if fs.ws is None:
+        return
+    loss = float(fs.cfg.get("daily_loss_limit") or 0)
+    profit = float(fs.cfg.get("daily_profit_target") or 0)
+    armed = 0 if fs.limit_day == trading_day() else 1
+    fs.limits_sent_day = trading_day()
+    await send(fs, "limits", f"{loss}|{profit}|{armed}")
+
+
+async def on_limit_hit(fs: FollowerState, hit: str, from_addon: bool) -> None:
+    today = trading_day()
+    first_today = fs.limit_day != today
+    fs.limit_day = today
+    if not fs.paused:
+        fs.paused = True
+        fs.pause_reason = hit
+        fs.loss_day = today
+    # A follower that was paused by hand still gets flattened: the limit protects the account either way.
+    if not from_addon and first_today:
+        await send(fs, "flatten", "ALL")
+    await send_limits(fs)
+    if first_today:
+        what = "daily loss limit" if hit == "loss_limit" else "daily max profit"
+        await alert(f"{fs.id} hit {what} (P&L {fs.pnl:.2f}); flattened and stopped until the next session (6 pm ET)")
+
+
 async def check_loss_limit(fs: FollowerState) -> None:
-    """Checks both the daily loss limit and the daily max profit."""
+    """Server-side backup for the daily loss limit and daily max profit (checked on every heartbeat).
+    Add-ons v9+ also check every second on their own computer."""
     hit = daily_limit_hit(fs)
-    if hit and not fs.paused:
+    if not hit:
+        return
+    if fs.limit_day != trading_day():
+        await on_limit_hit(fs, hit, from_addon=False)
+    elif not fs.paused:
+        # already hit today and someone pressed Start: stay stopped
         fs.paused = True
         fs.pause_reason = hit
         fs.loss_day = trading_day()
-        await send(fs, "flatten", "ALL")
-        what = "daily loss limit" if hit == "loss_limit" else "daily max profit"
-        await alert(f"{fs.id} hit {what} (P&L {fs.pnl:.2f}); flattened and paused until the next session (6 pm ET)")
+
+
+async def rearm_limits_if_clear(fs: FollowerState) -> None:
+    """After a limit is raised or copying is restarted by hand, re-arm the limits if P&L is back inside them."""
+    if fs.limit_day == trading_day() and not daily_limit_hit(fs):
+        fs.limit_day = None
+    await send_limits(fs)
 
 
 # ---------------- admin ----------------
@@ -665,6 +727,8 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
                 "last_error": fs.last_error if time.time() - fs.last_error_at < 60 else None,
                 "multiplier": float(fs.cfg.get("multiplier", 1.0)),
                 "max_contracts": int(fs.cfg.get("max_contracts", 1)),
+                "local_cap": fs.local_cap,
+                "effective_cap": effective_cap(fs),
                 "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
                 "daily_profit_target": float(fs.cfg.get("daily_profit_target") or 0),
             }
@@ -719,6 +783,7 @@ async def apply_settings(fs: FollowerState, new: dict, changed_by: str) -> None:
     summary = ", ".join(f"{k}={v}" for k, v in new.items())
     await alert(f"{fs.id} settings changed by {changed_by}: {summary}")
     await check_loss_limit(fs)
+    await rearm_limits_if_clear(fs)
 
 
 @app.post("/admin/followers/{follower_id}/settings")
@@ -977,6 +1042,8 @@ def follower_slot_status(fs: FollowerState) -> dict:
         "last_error": fs.last_error if time.time() - fs.last_error_at < 60 else None,
         "multiplier": float(fs.cfg.get("multiplier", 1.0)),
         "max_contracts": int(fs.cfg.get("max_contracts", 1)),
+        "local_cap": fs.local_cap,
+        "effective_cap": effective_cap(fs),
         "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
         "daily_profit_target": float(fs.cfg.get("daily_profit_target") or 0),
         "master_id": fs.cfg["master_id"],
@@ -1056,6 +1123,7 @@ async def my_follower_start(id: Optional[str] = None, x_follower_key: Optional[s
     fs.strikes = 0
     await alert(f"{fs.id} resumed copying from the follower page")
     await check_loss_limit(fs)
+    await rearm_limits_if_clear(fs)
     return {"ok": True, "paused": fs.paused}
 
 
@@ -1067,7 +1135,7 @@ async def sync_follower(fs: FollowerState, by: str) -> dict:
     ms = MASTER_STATE[fs.cfg["master_id"]]
     if not master_online(ms):
         raise HTTPException(status_code=409, detail="The master is offline, so there's nothing reliable to sync to.")
-    if fs.paused and fs.pause_reason in DAILY_STOP_REASONS:
+    if (fs.paused and fs.pause_reason in DAILY_STOP_REASONS) or (fs.limit_day == trading_day() and daily_limit_hit(fs)):
         raise HTTPException(status_code=409, detail="Copying is stopped for today by a daily limit.")
     if master_locked(ms):
         raise HTTPException(status_code=409, detail="The master reached its daily max profit, so copying is stopped until the next session.")

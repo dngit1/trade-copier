@@ -161,6 +161,7 @@
         <input id="maxc" type="number" step="1" min="1" max="500" inputmode="numeric" required>
       </label>
       <p class="muted">Copied orders are never larger than this, whatever the multiplier.</p>
+      <p id="capWarn" class="muted t-bad" style="font-weight:600" hidden></p>
       <label class="field">Daily loss limit ($)
         <input id="loss" type="number" step="50" min="0" inputmode="decimal" required>
       </label>
@@ -339,6 +340,12 @@
     $("syncBtn").disabled = !m.online || !s.ninjatrader_connected || (s.paused && ["loss_limit", "profit_target"].includes(s.pause_reason)) || s.master.locked || s.master.paused;
 
     renderAccount(s);
+    const cw = $("capWarn");
+    if (s.local_cap && s.local_cap < s.max_contracts) {
+      cw.hidden = false;
+      cw.textContent = "This computer's follower.txt limits each order to " + s.local_cap + " contract" + (s.local_cap === 1 ? "" : "s")
+        + ", so larger multiplier sizes are cut down to " + s.local_cap + ". Raise max_contracts in follower.txt (or remove it) to use the full size.";
+    } else cw.hidden = true;
 
     if (!dirty && !["mult", "maxc", "loss", "profit"].includes(document.activeElement && document.activeElement.id)) {
       $("mult").value = s.multiplier;

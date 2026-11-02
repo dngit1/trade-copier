@@ -420,6 +420,9 @@
       fact("Account", f.account || (f.connected ? "Not found" : "–")),
       fact("Today's P&L", pnl),
       fact("Open P&L", openPnlNode(f.open_pnl)),
+      fact("Size cap", f.local_cap && f.local_cap < f.max_contracts
+        ? el("span", { class: "pos-short", text: f.local_cap + " (follower.txt)" })
+        : String(f.effective_cap != null ? f.effective_cap : f.max_contracts)),
       fact("Position", positionsText(f.positions)),
       fact("Follows", f.master),
     );
