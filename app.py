@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import sqlite3
+from collections import deque
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -85,13 +86,14 @@ def record_pnl(kind: str, account_id: str, grp: str, nt_account: Optional[str], 
     if now - _pnl_last_write.get(cache_key, 0) < PNL_WRITE_EVERY_SEC:
         return
     _pnl_last_write[cache_key] = now
-    DB.execute("insert or replace into daily_pnl_v2 (day, nt_account, account_id, kind, grp, pnl, updated) "
-               "values (?, ?, ?, ?, ?, ?, ?)",
-               (trading_day(), nt_account, account_id, kind, grp, float(pnl), now))
-    DB.commit()
+    day = trading_day()
+    _PNL_BUF[(day, nt_account, account_id)] = (day, nt_account, account_id, kind, grp, float(pnl), now)
+    if not BACKGROUND["on"]:
+        flush_db()
 
 
 def pnl_history(start: Optional[str], end: Optional[str], ids: Optional[list] = None) -> dict:
+    flush_db()  # include the latest values
     today = trading_day()
     try:
         end_d = datetime.strptime(end, "%Y-%m-%d").date() if end else datetime.strptime(today, "%Y-%m-%d").date()
@@ -134,9 +136,40 @@ if _old and not DB.execute("select 1 from daily_pnl_v2 limit 1").fetchone():
 DB.commit()
 
 
+# Event logs and P&L rows are buffered and written in one batch per second by a background task, so saving
+# them never delays an order. (Without the background task, e.g. in tests, they are written immediately.)
+BACKGROUND = {"on": False}
+_LOG_BUF: list = []
+_PNL_BUF: dict = {}
+
+
 def log_event(source: str, who: str, body: str) -> None:
-    DB.execute("insert into events values (?, ?, ?, ?)", (time.time(), source, who, body))
-    DB.commit()
+    _LOG_BUF.append((time.time(), source, who, body))
+    if not BACKGROUND["on"]:
+        flush_db()
+
+
+def flush_db() -> None:
+    if not _LOG_BUF and not _PNL_BUF:
+        return
+    logs, rows = _LOG_BUF[:], list(_PNL_BUF.values())
+    _LOG_BUF.clear()
+    _PNL_BUF.clear()
+    try:
+        if logs:
+            DB.executemany("insert into events values (?, ?, ?, ?)", logs)
+        if rows:
+            DB.executemany("insert or replace into daily_pnl_v2 (day, nt_account, account_id, kind, grp, pnl, updated) "
+                           "values (?, ?, ?, ?, ?, ?, ?)", rows)
+        DB.commit()
+    except Exception:
+        log.exception("database write failed")
+
+
+async def db_flusher() -> None:
+    while True:
+        await asyncio.sleep(1)
+        flush_db()
 
 
 def load_setting(k: str) -> Optional[dict]:
@@ -173,6 +206,8 @@ class FollowerState:
         self.local_cap: Optional[int] = None    # max contracts from follower.txt on that computer (v9+ add-on)
         self.limit_day: Optional[str] = None    # trading day a daily loss limit / max profit was hit
         self.limits_sent_day: Optional[str] = None
+        self.send_lock = asyncio.Lock()          # one message at a time per follower, in order
+        self.delays: deque = deque(maxlen=50)    # copy delays in ms (master order received -> follower placed it)
         self.positions: dict = {}
         self.account: Optional[str] = None
         self.accounts: list = []
@@ -277,36 +312,79 @@ def expected_position(master_pos: int, fs: FollowerState) -> int:
     return q if master_pos > 0 else -q
 
 
-async def send(fs: FollowerState, kind: str, rest: str) -> None:
-    msg = f"{kind}|{next(SEQ)}|{rest}"
+SENT_AT: dict = {}   # seq -> (time the master's order reached the server, follower id)
+
+
+async def send(fs: FollowerState, kind: str, rest: str, t0: Optional[float] = None) -> None:
+    seq = next(SEQ)
+    msg = f"{kind}|{seq}|{rest}"
     if fs.ws is None:
         log_event("missed", fs.id, msg)
         await alert(f"Follower {fs.id} is offline, missed: {msg}")
         return
+    if t0 is not None:
+        SENT_AT[seq] = (t0, fs.id)
     try:
-        await fs.ws.send_text(msg)
+        async with fs.send_lock:
+            await fs.ws.send_text(msg)
         log_event("sent", fs.id, msg)
     except Exception as e:
+        SENT_AT.pop(seq, None)
         log_event("send_error", fs.id, f"{msg} :: {e}")
         await alert(f"Send to {fs.id} failed: {e}")
 
 
-async def fan_out(master_id: str, parts: list) -> None:
+async def fan_out(master_id: str, parts: list, t0: Optional[float] = None) -> None:
+    """Sends one master order to every follower of that master at the same time."""
     kind = parts[1]
     ms = MASTER_STATE[master_id]
     if kind != "cancel" and (master_locked(ms) or ms["paused"]):
         return  # master paused, or hit its daily max profit: nothing new is copied
+    jobs = []
     for fs in FOLLOWERS:
         if fs.cfg["master_id"] != master_id:
             continue
         if kind == "cancel":
-            await send(fs, "cancel", parts[2])  # cancels always go through, even when paused
+            jobs.append(send(fs, "cancel", parts[2], t0))  # cancels always go through, even when paused
             continue
         if fs.paused:
             continue
         oid, inst, action, otype, qty, limit, stop, oco, tif = parts[2:11]
         q = scale_qty(int(qty), fs)
-        await send(fs, kind, f"{oid}|{inst}|{action}|{otype}|{q}|{limit}|{stop}|{oco}|{tif}")
+        jobs.append(send(fs, kind, f"{oid}|{inst}|{action}|{otype}|{q}|{limit}|{stop}|{oco}|{tif}", t0))
+    if jobs:
+        await asyncio.gather(*jobs)
+
+
+# Each master has its own queue and worker, so the server answers the master at once (its stop and target
+# aren't held up) while every follower still receives that master's messages in the original order.
+MASTER_QUEUES: dict = {}
+
+
+async def run_master_job(master_id: str, job: tuple) -> None:
+    what, payload, t0 = job
+    if what == "orders":
+        await fan_out(master_id, payload, t0)
+    elif what == "flat":
+        inst, keep = payload
+        await follow_master_flat(master_id, inst, keep)
+
+
+async def master_worker(master_id: str) -> None:
+    q = MASTER_QUEUES[master_id]
+    while True:
+        job = await q.get()
+        try:
+            await run_master_job(master_id, job)
+        except Exception:
+            log.exception("copying failed for master %s", master_id)
+
+
+async def dispatch(master_id: str, job: tuple) -> None:
+    if BACKGROUND["on"] and master_id in MASTER_QUEUES:
+        MASTER_QUEUES[master_id].put_nowait(job)
+    else:
+        await run_master_job(master_id, job)
 
 
 async def follow_master_flat(master_id: str, inst: str, keep: Optional[str] = None) -> None:
@@ -316,12 +394,9 @@ async def follow_master_flat(master_id: str, inst: str, keep: Optional[str] = No
     # The master add-on (v9+) sends this list itself the moment it goes flat; otherwise use the last heartbeat.
     if keep is None:
         keep = ",".join(o["id"] for o in MASTER_STATE[master_id]["orders"] if o["instrument"] == inst)
-    sent = []
-    for fs in FOLLOWERS:
-        if fs.cfg["master_id"] != master_id or fs.paused or fs.ws is None:
-            continue
-        await send(fs, "flatcheck", f"{inst}|{keep}")
-        sent.append(fs.id)
+    targets = [fs for fs in FOLLOWERS if fs.cfg["master_id"] == master_id and not fs.paused and fs.ws is not None]
+    await asyncio.gather(*(send(fs, "flatcheck", f"{inst}|{keep}") for fs in targets))
+    sent = [fs.id for fs in targets]
     if sent:  # happens on every exit, so log it instead of sending an alert
         log.info("Master went flat in %s; flat check sent to %s", inst, sent)
 
@@ -413,6 +488,8 @@ async def monitor() -> None:
     while True:
         await asyncio.sleep(5)
         now = time.time()
+        for seq in [k for k, v in SENT_AT.items() if now - v[0] > 120]:
+            SENT_AT.pop(seq, None)
         for mid, ms in MASTER_STATE.items():
             if ms["last_hb"] and now - ms["last_hb"] > MASTER_TIMEOUT_SEC and not ms["offline_alerted"]:
                 ms["offline_alerted"] = True
@@ -444,9 +521,16 @@ async def monitor() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(monitor())
+    BACKGROUND["on"] = True
+    tasks = [asyncio.create_task(monitor()), asyncio.create_task(db_flusher())]
+    for mid in MASTER_STATE:
+        MASTER_QUEUES[mid] = asyncio.Queue()
+        tasks.append(asyncio.create_task(master_worker(mid)))
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
+    BACKGROUND["on"] = False
+    flush_db()
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -494,6 +578,7 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
     master = MASTERS.get(x_master_key or "")
     if not master:
         raise HTTPException(status_code=401, detail="bad master key")
+    t0 = time.time()
     body = (await request.body()).decode("utf-8").strip()
     parts = body.split("|")
     ms = MASTER_STATE[master["id"]]
@@ -521,7 +606,7 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
         if not switched:
             gone_flat = [i for i, q in before.items() if q and not ms["positions"].get(i)]
             for inst in gone_flat:
-                await follow_master_flat(master["id"], inst)
+                await dispatch(master["id"], ("flat", (inst, None), t0))
         if len(parts) > 5 and parts[5]:
             try:
                 ms["pnl"] = float(parts[5])
@@ -540,12 +625,12 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
     if parts[0] == "order" and len(parts) >= 3 and parts[1] == "flat":
         # Sent by the master add-on the instant it goes flat in an instrument, even for trades shorter than
         # a heartbeat. Followers close leftovers and cancel copied orders the master no longer has.
-        await follow_master_flat(master["id"], parts[2], parts[3] if len(parts) > 3 else "")
+        await dispatch(master["id"], ("flat", (parts[2], parts[3] if len(parts) > 3 else ""), t0))
         return master_reply(master["id"], ms)
     if parts[0] == "order" and len(parts) >= 3 and parts[1] in ("new", "change", "cancel"):
         if parts[1] != "cancel" and len(parts) < 11:
             raise HTTPException(status_code=400, detail="malformed order message")
-        await fan_out(master["id"], parts)
+        await dispatch(master["id"], ("orders", parts, t0))
     return master_reply(master["id"], ms)
 
 
@@ -602,6 +687,9 @@ async def follower_socket(ws: WebSocket):
                 await on_limit_hit(fs, parts[1] if parts[1] in DAILY_STOP_REASONS else "loss_limit", from_addon=True)
             elif parts[0] == "ack":
                 log_event("ack", fs.id, text)
+                sent = SENT_AT.pop(int(parts[1]), None) if len(parts) > 2 and parts[1].isdigit() else None
+                if sent and parts[2] == "ok":
+                    fs.delays.append((time.time() - sent[0]) * 1000)
                 if len(parts) > 2 and parts[2] == "err":
                     fs.last_error = "|".join(parts[3:])
                     fs.last_error_at = time.time()
@@ -731,6 +819,8 @@ async def status(x_admin_key: Optional[str] = Header(default=None)):
                 "effective_cap": effective_cap(fs),
                 "daily_loss_limit": float(fs.cfg.get("daily_loss_limit") or 0),
                 "daily_profit_target": float(fs.cfg.get("daily_profit_target") or 0),
+                "delay_avg_ms": round(sum(fs.delays) / len(fs.delays)) if fs.delays else None,
+                "delay_last_ms": round(fs.delays[-1]) if fs.delays else None,
             }
             for fs in FOLLOWERS
         },
