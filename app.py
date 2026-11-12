@@ -25,6 +25,7 @@ Wire format is pipe-delimited plain text (easy to parse in NinjaScript):
 import asyncio
 import itertools
 import json
+import re
 import logging
 import os
 import sqlite3
@@ -209,6 +210,7 @@ class FollowerState:
         self.send_lock = asyncio.Lock()          # one message at a time per follower, in order
         self.delays: deque = deque(maxlen=50)    # copy delays in ms (master order received -> follower placed it)
         self.positions: dict = {}
+        self.inst_style: Optional[str] = None  # "num" = 'MNQ 12-26', "mon" = 'MNQ DEC26'
         self.account: Optional[str] = None
         self.accounts: list = []
         self.last_error: Optional[str] = None
@@ -275,6 +277,57 @@ def parse_positions(text: str) -> dict:
 
 
 ORDER_FIELDS = ("id", "instrument", "action", "type", "qty", "limit", "stop", "oco", "tif")
+
+
+_MONTHS = {"JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
+           "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"}
+_MON_BY_NUM = {v: k for k, v in _MONTHS.items()}
+_MON_RE = re.compile(r"^(.+) ([A-Z]{3})(\d{2})$")
+_NUM_RE = re.compile(r"^(.+) (\d{2})-(\d{2})$")
+
+
+def normalize_inst(name: str) -> str:
+    """NinjaTrader can name the same contract 'MNQ DEC26' or 'MNQ 12-26' depending on version and settings.
+    Compare contracts by one form: 'ROOT MM-YY'."""
+    name = (name or "").strip()
+    m = _MON_RE.match(name.upper())
+    if m and m.group(2) in _MONTHS:
+        return f"{name[:len(m.group(1))]} {_MONTHS[m.group(2)]}-{m.group(3)}"
+    return name
+
+
+def inst_style(name: str) -> Optional[str]:
+    if _NUM_RE.match(name or ""):
+        return "num"
+    m = _MON_RE.match((name or "").upper())
+    if m and m.group(2) in _MONTHS:
+        return "mon"
+    return None
+
+
+def canon_positions(positions: dict) -> dict:
+    out = {}
+    for i, q in positions.items():
+        if q:
+            k = normalize_inst(i)
+            out[k] = out.get(k, 0) + q
+    return out
+
+
+def follower_inst_name(fs: "FollowerState", inst: str) -> str:
+    """The contract name in the form this follower's NinjaTrader uses (it matches positions and orders by name)."""
+    canon = normalize_inst(inst)
+    for raw in fs.positions:
+        if normalize_inst(raw) == canon:
+            return raw
+    style = fs.inst_style
+    if style == "num":
+        return canon
+    if style == "mon":
+        m = _NUM_RE.match(canon)
+        if m and m.group(2) in _MON_BY_NUM:
+            return f"{m.group(1)} {_MON_BY_NUM[m.group(2)]}{m.group(3)}"
+    return inst
 
 
 def parse_orders(text: str) -> list:
@@ -393,9 +446,10 @@ async def follow_master_flat(master_id: str, inst: str, keep: Optional[str] = No
     # Master orders still working in this instrument (e.g. a new entry limit) must not be cleared.
     # The master add-on (v9+) sends this list itself the moment it goes flat; otherwise use the last heartbeat.
     if keep is None:
-        keep = ",".join(o["id"] for o in MASTER_STATE[master_id]["orders"] if o["instrument"] == inst)
+        canon = normalize_inst(inst)
+        keep = ",".join(o["id"] for o in MASTER_STATE[master_id]["orders"] if normalize_inst(o["instrument"]) == canon)
     targets = [fs for fs in FOLLOWERS if fs.cfg["master_id"] == master_id and not fs.paused and fs.ws is not None]
-    await asyncio.gather(*(send(fs, "flatcheck", f"{inst}|{keep}") for fs in targets))
+    await asyncio.gather(*(send(fs, "flatcheck", f"{follower_inst_name(fs, inst)}|{keep}") for fs in targets))
     sent = [fs.id for fs in targets]
     if sent:  # happens on every exit, so log it instead of sending an alert
         log.info("Master went flat in %s; flat check sent to %s", inst, sent)
@@ -477,9 +531,11 @@ async def close_leftovers(fs: "FollowerState", ms: dict, expected: dict, actual:
     never trigger it."""
     if not master_online(ms) or ms["paused"] or fs.paused:
         return
-    for inst, qty in actual.items():
-        if qty and not expected.get(inst):
-            keep = ",".join(o["id"] for o in ms["orders"] if o["instrument"] == inst)
+    expected = canon_positions(expected)
+    for inst, qty in list(fs.positions.items()):
+        canon = normalize_inst(inst)
+        if qty and not expected.get(canon):
+            keep = ",".join(o["id"] for o in ms["orders"] if normalize_inst(o["instrument"]) == canon)
             await send(fs, "flatcheck", f"{inst}|{keep}")
             await alert(f"{fs.id}: master is flat in {inst} but {fs.id} still held {qty}; closing it")
 
@@ -508,8 +564,8 @@ async def monitor() -> None:
                 continue
             fs.stale_alerted = False
             ms = MASTER_STATE[fs.cfg["master_id"]]
-            expected = {i: expected_position(p, fs) for i, p in ms["positions"].items() if p}
-            actual = {i: p for i, p in fs.positions.items() if p}
+            expected = {i: expected_position(p, fs) for i, p in canon_positions(ms["positions"]).items() if p}
+            actual = canon_positions(fs.positions)
             if expected != actual:
                 fs.strikes += 1
                 if fs.strikes == RECON_STRIKES:
@@ -604,7 +660,8 @@ async def master_event(request: Request, x_master_key: Optional[str] = Header(de
         # which never shows up as a copyable order): make sure followers are flat there too,
         # and clear their leftover copied stops/targets.
         if not switched:
-            gone_flat = [i for i, q in before.items() if q and not ms["positions"].get(i)]
+            now_canon = canon_positions(ms["positions"])
+            gone_flat = [i for i, q in before.items() if q and not now_canon.get(normalize_inst(i))]
             for inst in gone_flat:
                 await dispatch(master["id"], ("flat", (inst, None), t0))
         if len(parts) > 5 and parts[5]:
@@ -665,6 +722,8 @@ async def follower_socket(ws: WebSocket):
                 fs.last_hb = time.time()
                 fs.pnl = float(parts[1])
                 fs.positions = parse_positions(parts[2])
+                for raw in fs.positions:
+                    fs.inst_style = inst_style(raw) or fs.inst_style
                 if len(parts) > 3:
                     fs.account = parts[3] or None
                 if len(parts) > 4:
@@ -1142,7 +1201,8 @@ def follower_slot_status(fs: FollowerState) -> dict:
             "online": master_online(ms),
             "locked": master_locked(ms),
             "paused": ms["paused"],
-            "positions": {i: expected_position(p, fs) for i, p in ms["positions"].items() if p},
+            "positions": {follower_inst_name(fs, i): expected_position(p, fs)
+                          for i, p in canon_positions(ms["positions"]).items() if p},
         },
         "mismatch": fs.strikes >= RECON_STRIKES,
     }
@@ -1231,7 +1291,8 @@ async def sync_follower(fs: FollowerState, by: str) -> dict:
         raise HTTPException(status_code=409, detail="The master reached its daily max profit, so copying is stopped until the next session.")
     if ms["paused"]:
         raise HTTPException(status_code=409, detail="Copying is paused on the master.")
-    targets = {i: expected_position(p, fs) for i, p in ms["positions"].items() if p}
+    targets = {follower_inst_name(fs, i): expected_position(p, fs)
+               for i, p in canon_positions(ms["positions"]).items() if p}
     pos_text = ";".join(f"{i}={q}" for i, q in targets.items())
     orders_text = ";".join("~".join(str(o[k]) for k in ORDER_FIELDS) for o in scaled_orders(ms["orders"], fs))
     set_manual_pause(fs, False)
