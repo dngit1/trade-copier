@@ -126,6 +126,10 @@
       <button id="masterBtn" class="btn" type="button" disabled>Change master</button>
       <div id="masterStatus" class="status" style="margin-top:12px"><span class="dot"></span><span>Checking…</span></div>
       <p id="masterNote" class="muted"></p>
+      <dl>
+        <div><dt>Master's P&amp;L today</dt><dd id="mPnl">–</dd></div>
+        <div><dt>Master's open P&amp;L</dt><dd id="mOpenPnl">–</dd></div>
+      </dl>
       <p id="mismatchNote" class="muted t-bad" style="font-weight:600" hidden>Your position doesn't match the master's.</p>
       <button id="syncBtn" class="btn" type="button">Sync to master</button>
       <p class="muted">Cancels your copied orders, trades the difference at market so your position matches the master's, then places the master's stop and target orders for you.</p>
@@ -325,6 +329,8 @@
       msel.value = s.master_id;
     }
     $("masterBtn").disabled = !msel.value || msel.value === s.master_id;
+    setMoney($("mPnl"), m.online ? m.pnl : null);
+    setMoney($("mOpenPnl"), m.online ? m.open_pnl : null);
 
     const pnl = $("pnl");
     pnl.textContent = (s.pnl < 0 ? "−$" : "$") + Math.abs(s.pnl).toFixed(2);
@@ -513,6 +519,12 @@
     if (name === "lastmonth") return [ymd(new Date(t.getFullYear(), t.getMonth() - 1, 1)), ymd(new Date(t.getFullYear(), t.getMonth(), 0))];
     return [back(13), todayStr];
   }
+  function setMoney(el, v) {
+    if (v == null) { el.textContent = "–"; el.className = ""; return; }
+    el.textContent = (v < 0 ? "−$" : "$") + Math.abs(v).toFixed(2);
+    el.className = v < 0 ? "t-bad" : v > 0 ? "t-good" : "";
+  }
+
   function moneyTd(n, extra) {
     if (n == null) return mk("td", { class: "muted" + (extra ? " " + extra : ""), text: "–" });
     return mk("td", { class: (n < 0 ? "t-bad" : n > 0 ? "t-good" : "") + (extra ? " " + extra : ""),

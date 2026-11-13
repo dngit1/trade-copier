@@ -1201,6 +1201,8 @@ def follower_slot_status(fs: FollowerState) -> dict:
             "online": master_online(ms),
             "locked": master_locked(ms),
             "paused": ms["paused"],
+            "pnl": ms["pnl"],
+            "open_pnl": ms["open_pnl"],
             "positions": {follower_inst_name(fs, i): expected_position(p, fs)
                           for i, p in canon_positions(ms["positions"]).items() if p},
         },
